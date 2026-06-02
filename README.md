@@ -1,46 +1,46 @@
 # Material Color Grid Texture
 
-A Blender add-on that bakes the Base Color of each material on an object into a single grid texture, builds a new material that uses it, and stores the original material assignment as vertex groups so you can re-select faces later.
+オブジェクトの各マテリアルのBase Colorを1枚のグリッドテクスチャに焼き込み、それを使う新しいマテリアルを作って割り当てるBlenderアドオンです。元のマテリアル割り当ては頂点グループとして保存されるので、後から面を選び直せます。
 
 ![grid example](docs/example.png)
 
-## What it does
+## できること
 
-Given a mesh with several materials:
+複数マテリアルが設定されたメッシュに対して：
 
-1. Collects the **Principled BSDF → Base Color** of every material slot.
-2. Generates a square texture split into a `ceil(√n) × ceil(n/cols)` grid of solid colors (e.g. 4 mats → 2×2, 10 mats → 4×3 with 2 empty cells).
-3. Creates a new material with that texture (Image Texture → Principled BSDF, `Closest` interpolation) and assigns it.
-4. Optionally creates a new UV map (`ColorGridUV`) where every face is mapped to its original material's color cell — so the result visually matches the original — and removes all other UV maps.
-5. Optionally creates one vertex group per original material name, containing the verts of the faces that used it, so you can re-select them via `Select → Vertex Group`.
+1. 全マテリアルスロットから **Principled BSDF → Base Color** を収集
+2. `ceil(√n) × ceil(n/cols)` のグリッドに分割したソリッドカラーのテクスチャを生成（例：4マテリアル → 2×2、10マテリアル → 4×3で2マス空き）
+3. そのテクスチャを使う新しいマテリアル（Image Texture → Principled BSDF、補間は `Closest`）を作成して割り当て
+4. オプションで新しいUVマップ（`ColorGridUV`）を作成し、各面を元のマテリアルの色セルにマッピング（見た目を維持できる）。既存のUVマップは全て削除されます
+5. オプションで元のマテリアル名と同じ名前の頂点グループを作成し、そのマテリアルが使われていた面の頂点を登録（`選択 → 頂点グループ` で後から再選択可能）
 
-Color values are linear→sRGB-encoded before being written, so the sampled color in the new shader matches the original Base Color exactly.
+色は linear → sRGB エンコードしてから書き込んでいるので、新しいシェーダーでサンプルした色が元のBase Colorと完全に一致します。
 
-## Installation
+## インストール
 
-1. Download `material_color_grid.py` (or this repo as a zip).
-2. In Blender: `Edit → Preferences → Add-ons → Install...`
-3. Pick the `.py` file and enable the checkbox.
+1. `material_color_grid.py` をダウンロード（またはこのリポジトリをzipで取得）
+2. Blender で `編集 → プリファレンス → アドオン → インストール...`
+3. `.py` ファイルを選んで、チェックボックスを有効化
 
-Tested on Blender 3.x and 4.x.
+Blender 3.x / 4.x で動作確認しています。
 
-## Usage
+## 使い方
 
-1. Select a mesh object that has multiple materials.
-2. `Object` menu → **Material Color Grid Texture**, or press `F3` and search for it.
-3. Tweak options in the Redo panel (bottom-left):
-   - **Resolution** — texture size (square)
-   - **Create Vertex Groups** — one group per original material name
-   - **Remap UVs to Color Cells** — replace UV maps with a new one pointing at each face's color cell
-   - **Replace Material Slots** — wipe old slots and assign only the new grid material
+1. 複数マテリアルを持つメッシュオブジェクトを選択
+2. `オブジェクト` メニュー → **Material Color Grid Texture**、または `F3` で検索して実行
+3. 左下のやり直しパネル（Redoパネル）でオプション調整：
+   - **Resolution** — テクスチャの解像度（正方形）
+   - **Create Vertex Groups** — 元のマテリアル名で頂点グループを作成
+   - **Remap UVs to Color Cells** — UVマップを置き換えて、各面を対応する色セルに飛ばす
+   - **Replace Material Slots** — 既存のマテリアルスロットを全削除して新マテリアルだけにする
 
-## Notes
+## 補足
 
-- Same material used in multiple slots is collapsed to a single cell.
-- Materials without a Principled BSDF fall back to the viewport diffuse color.
-- The generated image is packed into the .blend; export it with `Image → Save As` if you need an external file.
-- Vertex groups are created with weight 1.0 on every vertex of the relevant faces; verts on material boundaries will belong to multiple groups.
+- 同じマテリアルが複数スロットに入っていても1つの色セルにまとめられます
+- Principled BSDFが無いマテリアルはビューポートのdiffuse colorにフォールバックします
+- 生成された画像は .blend にパックされます。外部ファイルとして必要なら `画像 → 名前を付けて保存` で書き出してください
+- 頂点グループはウェイト1.0で登録されます。マテリアル境界上の頂点は複数のグループに属します
 
-## License
+## ライセンス
 
-MIT — see [LICENSE](LICENSE).
+MIT — 詳細は [LICENSE](LICENSE) を参照
