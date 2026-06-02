@@ -2,7 +2,7 @@
 
 オブジェクトの各マテリアルのBase Colorを1枚のグリッドテクスチャに焼き込み、それを使う新しいマテリアルを作って割り当てるBlenderアドオンです。元のマテリアル割り当ては頂点グループとして保存されるので、後から面を選び直せます。
 
-![grid example](docs/example.png)
+![grid example](example.png)
 
 ## できること
 
