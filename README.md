@@ -2,13 +2,14 @@
 
 選択した複数オブジェクトのマテリアルのBase Colorを **1枚の共有グリッドテクスチャ** にまとめ、共有マテリアルとして全オブジェクトに割り当てるBlenderアドオンです。メッシュは結合されず分割されたままで、元のマテリアル割り当ては頂点グループとして保存されます。
 
-色の追加（インクリメンタル更新）、グリッドからのマテリアル復元、未使用色の掃除、極小テクスチャ化、PNG書き出しに対応。主にBlender → Roblox Studio 移行で、テクスチャアセットの枚数・容量を最小化する用途を想定しています。
+ベースカラーに加えてラフネス／メタリックのテクスチャ生成、色の追加（インクリメンタル更新）、グリッドからのマテリアル復元、未使用色の掃除、極小テクスチャ化、PNG書き出しに対応。主にBlender → Roblox Studio 移行で、テクスチャアセットの枚数・容量を最小化する用途を想定しています。
 
 ![grid example](docs/example.png)
 
 ## 主な機能
 
 - 選択オブジェクト全体から Base Color を集約して1枚のグリッドテクスチャを生成
+- ラフネス／メタリックもグレースケールのグリッドテクスチャとして生成（値は0.1刻みで四捨五入）
 - 後から別オブジェクトを追加しても、既存色を保持したまま新色を追加して更新
 - グリッドから元の色ごとのマテリアルを復元（焼き戻しの逆変換）
 - テクスチャ／マテリアルの命名・リネーム
@@ -34,6 +35,7 @@ Blender 3.x / 4.x で動作確認しています。
 - **Grid Name** — 新規グリッドのテクスチャ名・マテリアル名（リネーム時の目標名にも使用）
 - **Minimal Resolution** — ONで極小テクスチャ化（`Cell Pixels` が表示される）
 - **Resolution / Cell Pixels** — 通常解像度、または最小モード時のセルあたりピクセル数
+- **Roughness Map / Metallic Map** — ラフネス／メタリックのグレースケールテクスチャも生成（値は0.1刻みで四捨五入）
 - **Vertex Groups / Remap UVs / Replace Slots / Update All Users** — オプション
 - **Bake Selected to Grid** — 上記設定でグリッドに焼く／更新
 
@@ -41,7 +43,7 @@ Blender 3.x / 4.x で動作確認しています。
 - **Rename Current Grid** — 選択中のグリッドのテクスチャ＆マテリアルを Grid Name にリネーム
 - **Select Objects Using Grid** — そのグリッドを使う全オブジェクトを一括選択
 - **Compact Grid (Remove Unused)** — どのオブジェクトにも使われていない色を除去して詰める
-- **Export Texture (PNG)** — テクスチャをPNGとして書き出し。ダイアログの **Reference Exported File (Unpack)**（デフォルトON）で、書き出したPNGを画像の参照先に設定しパック解除する。これによりFBXエクスポート時にテクスチャが実ファイルとして参照され、Roblox Studioでテクスチャが読み込まれない問題を回避できる
+- **Export Textures (PNG)** — テクスチャをPNGとして書き出し。ダイアログの **Reference Exported File (Unpack)**（デフォルトON）で、書き出したPNGを画像の参照先に設定しパック解除する。これによりFBXエクスポート時にテクスチャが実ファイルとして参照され、Roblox Studioでテクスチャが読み込まれない問題を回避できる
 
 ### Reverse セクション
 - **Restore Materials** — グリッドから個別マテリアルを復元
@@ -74,7 +76,7 @@ Blender 3.x / 4.x で動作確認しています。
 
 1. 不要になった色は **Compact Grid** で除去してグリッドを詰める
 2. **Minimal Resolution** をONにして再 **Bake** → 極小テクスチャ化（`Cell Pixels=8` 程度ならRobloxのフィルタでも色のにじみが出にくい）
-3. **Export Texture (PNG)** でPNGを書き出す（**Reference Exported File** をONにしておくと画像がパック解除され、ディスク上の実ファイルを参照する状態になる）
+3. **Export Textures (PNG)** でPNGを書き出す（**Reference Exported File** をONにしておくと画像がパック解除され、ディスク上の実ファイルを参照する状態になる）
 4. FBXエクスポート（Path Mode = `Copy` ＋ Embed Textures 推奨）→ Roblox Studio でインポート
 
 > パック状態（.blend埋め込み）のままFBX書き出しすると、テクスチャがディスク上の実ファイルとして参照されず、Roblox側で読み込まれないことがあります。**Reference Exported File** で実ファイル参照にしておくと回避できます。Robloxの埋め込みテクスチャ読み込みは不安定なこともあるため、書き出したPNGを別途アップロードしてTextureID/SurfaceAppearanceで手動適用するのが最も確実です。
