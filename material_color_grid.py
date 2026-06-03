@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Material Color Grid Texture",
     "author": "Claude",
-    "version": (1, 3, 0),
+    "version": (1, 5, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > Color Grid tab",
     "description": "Pool base colors from selected objects into one shared grid "
@@ -200,6 +200,37 @@ def objects_using_material(mat):
 
 
 # ----------------------------------------------------------------------------
+# Panel settings (persistent, shown in the sidebar)
+# ----------------------------------------------------------------------------
+
+class MCGSettings(bpy.types.PropertyGroup):
+    grid_name: bpy.props.StringProperty(
+        name="Grid Name",
+        description="Name for a new grid (texture + material), and the target name when renaming",
+        default=DEFAULT_GROUP_NAME,
+    )
+    resolution: bpy.props.IntProperty(
+        name="Resolution", description="Texture resolution (square)",
+        default=512, min=16, max=8192,
+    )
+    minimal_resolution: bpy.props.BoolProperty(
+        name="Minimal Resolution",
+        description="Make a tiny texture sized to the grid (cells x Cell Pixels) instead of a "
+                    "square Resolution. Great for solid-color grids destined for Roblox",
+        default=False,
+    )
+    cell_pixels: bpy.props.IntProperty(
+        name="Cell Pixels",
+        description="Pixels per cell when Minimal Resolution is on",
+        default=8, min=1, max=256,
+    )
+    create_vertex_groups: bpy.props.BoolProperty(name="Vertex Groups", default=True)
+    remap_uvs: bpy.props.BoolProperty(name="Remap UVs", default=True)
+    replace_materials: bpy.props.BoolProperty(name="Replace Slots", default=True)
+    sync_all_users: bpy.props.BoolProperty(name="Update All Users", default=True)
+
+
+# ----------------------------------------------------------------------------
 # Operator
 # ----------------------------------------------------------------------------
 
@@ -220,6 +251,16 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
                     "an existing grid (the selected object's existing texture is reused). "
                     "If the name already exists, a number suffix is added automatically",
         default=DEFAULT_GROUP_NAME,
+    )
+    minimal_resolution: bpy.props.BoolProperty(
+        name="Minimal Resolution",
+        description="Size the texture to the grid (cells x Cell Pixels) instead of a square Resolution",
+        default=False,
+    )
+    cell_pixels: bpy.props.IntProperty(
+        name="Cell Pixels",
+        description="Pixels per cell when Minimal Resolution is on",
+        default=8, min=1, max=256,
     )
     create_vertex_groups: bpy.props.BoolProperty(
         name="Create Vertex Groups",
@@ -288,17 +329,29 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
             self.report({'ERROR'}, "No valid materials found on selected objects")
             return {'CANCELLED'}
 
+        # ---- Resolve target texture dimensions ----
+        n = len(manifest)
+        grid_cols, grid_rows = calculate_grid(n)
+        if self.minimal_resolution:
+            target_w = grid_cols * self.cell_pixels
+            target_h = grid_rows * self.cell_pixels
+        else:
+            target_w = target_h = self.resolution
+
         # ---- Resolve the texture image and shared material ----
         if shared_mat is None:
             # Fresh grid: create uniquely-named image + material from group_name.
             name = (self.group_name or DEFAULT_GROUP_NAME).strip() or DEFAULT_GROUP_NAME
-            img = new_grid_image(name, self.resolution, self.resolution)
+            img = new_grid_image(name, target_w, target_h)
             shared_mat = bpy.data.materials.new(name=name + "_Mat")
         else:
-            # Update mode: reuse the material's existing image (keep its name/size).
+            # Update mode: reuse the material's existing image.
             img = get_material_image(shared_mat)
             if img is None:
-                img = new_grid_image(shared_mat.name + "_Tex", self.resolution, self.resolution)
+                img = new_grid_image(shared_mat.name + "_Tex", target_w, target_h)
+            elif self.minimal_resolution and (img.size[0] != target_w or img.size[1] != target_h):
+                # In minimal mode, keep the image sized exactly to the grid.
+                img.scale(target_w, target_h)
 
         colors_linear = [tuple(e["color"]) for e in manifest]
         uv_centers, new_cols, new_rows = write_grid_pixels(img, colors_linear)
@@ -480,6 +533,190 @@ class OBJECT_OT_restore_materials_from_grid(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class OBJECT_OT_rename_grid(bpy.types.Operator):
+    """Rename the grid texture and material used by the selected objects"""
+    bl_idname = "object.rename_color_grid"
+    bl_label = "Rename Current Grid"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    new_name: bpy.props.StringProperty(name="New Name", default="")
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.type == 'MESH' for o in context.selected_objects)
+
+    def execute(self, context):
+        sel = [o for o in context.selected_objects if o.type == 'MESH']
+        mat = find_shared_material_from(sel)
+        if mat is None:
+            self.report({'ERROR'}, "Selected objects don't use a grid material")
+            return {'CANCELLED'}
+        name = (self.new_name or "").strip()
+        if not name:
+            self.report({'ERROR'}, "Enter a name first")
+            return {'CANCELLED'}
+
+        img = get_material_image(mat)
+        mat.name = name + "_Mat"
+        if img is not None:
+            img.name = name
+        self.report({'INFO'}, f"Renamed grid to '{name}'")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_select_grid_users(bpy.types.Operator):
+    """Select every object in the file that uses the same grid material"""
+    bl_idname = "object.select_color_grid_users"
+    bl_label = "Select Objects Using Grid"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.type == 'MESH' for o in context.selected_objects)
+
+    def execute(self, context):
+        sel = [o for o in context.selected_objects if o.type == 'MESH']
+        mat = find_shared_material_from(sel)
+        if mat is None:
+            self.report({'ERROR'}, "Selected objects don't use a grid material")
+            return {'CANCELLED'}
+
+        users = objects_using_material(mat)
+        for o in context.selected_objects:
+            o.select_set(False)
+        for o in users:
+            o.select_set(True)
+        if users:
+            context.view_layer.objects.active = users[0]
+        self.report({'INFO'}, f"Selected {len(users)} object(s) using '{mat.name}'")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_export_grid_png(bpy.types.Operator):
+    """Save the grid texture to a PNG file (e.g. to upload to Roblox)"""
+    bl_idname = "object.export_color_grid_png"
+    bl_label = "Export Grid Texture (PNG)"
+    bl_options = {'REGISTER'}
+
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    filename_ext = ".png"
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.type == 'MESH' for o in context.selected_objects)
+
+    def _get_image(self, context):
+        sel = [o for o in context.selected_objects if o.type == 'MESH']
+        mat = find_shared_material_from(sel)
+        if mat is None:
+            return None
+        return get_material_image(mat)
+
+    def invoke(self, context, event):
+        img = self._get_image(context)
+        if img is None:
+            self.report({'ERROR'}, "Selected objects don't use a grid material with a texture")
+            return {'CANCELLED'}
+        self.filepath = (img.name or "ColorGrid") + ".png"
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        img = self._get_image(context)
+        if img is None:
+            self.report({'ERROR'}, "No grid texture found")
+            return {'CANCELLED'}
+        path = self.filepath
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        img.filepath_raw = path
+        img.file_format = 'PNG'
+        try:
+            img.save()
+        except RuntimeError as e:
+            self.report({'ERROR'}, f"Save failed: {e}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Saved texture to {path}")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_compact_grid(bpy.types.Operator):
+    """Remove color cells no longer used by any object, then re-pack the grid"""
+    bl_idname = "object.compact_color_grid"
+    bl_label = "Compact Grid (Remove Unused)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.type == 'MESH' for o in context.selected_objects)
+
+    def execute(self, context):
+        sel = [o for o in context.selected_objects if o.type == 'MESH']
+        mat = find_shared_material_from(sel)
+        if mat is None:
+            self.report({'ERROR'}, "Selected objects don't use a grid material")
+            return {'CANCELLED'}
+        manifest = read_manifest(mat)
+        if not manifest:
+            self.report({'ERROR'}, "No manifest stored on the grid material")
+            return {'CANCELLED'}
+
+        old_cols, old_rows = calculate_grid(len(manifest))
+        img = get_material_image(mat)
+        if img is None:
+            self.report({'ERROR'}, "No texture image found")
+            return {'CANCELLED'}
+
+        # Scan every object using this grid: which cells are actually used?
+        users = objects_using_material(mat)
+        used = set()
+        per_obj = {}  # mesh name -> (uv_layer, [(poly, old_idx)])
+        for obj in users:
+            mesh = obj.data
+            if mesh.name in per_obj:
+                continue
+            uv_layer = mesh.uv_layers.get(UV_LAYER_NAME) or mesh.uv_layers.active
+            if uv_layer is None:
+                continue
+            faces = []
+            for poly in mesh.polygons:
+                u, v = uv_layer.data[poly.loop_indices[0]].uv
+                idx = min(uv_to_cell_index(u, v, old_cols, old_rows), len(manifest) - 1)
+                used.add(idx)
+                faces.append((poly, idx))
+            per_obj[mesh.name] = (uv_layer, faces)
+
+        if not used:
+            self.report({'ERROR'}, "No objects with grid UVs found")
+            return {'CANCELLED'}
+
+        removed = len(manifest) - len(used)
+        if removed <= 0:
+            self.report({'INFO'}, "No unused colors to remove")
+            return {'FINISHED'}
+
+        # Build compacted manifest, preserving relative order
+        old_to_new = {}
+        new_manifest = []
+        for old_idx in sorted(used):
+            old_to_new[old_idx] = len(new_manifest)
+            new_manifest.append(manifest[old_idx])
+
+        # Repaint and remap
+        colors_linear = [tuple(e["color"]) for e in new_manifest]
+        uv_centers, _, _ = write_grid_pixels(img, colors_linear)
+        write_manifest(mat, new_manifest)
+
+        for uv_layer, faces in per_obj.values():
+            for poly, old_idx in faces:
+                new_uv = uv_centers[old_to_new[old_idx]]
+                for li in poly.loop_indices:
+                    uv_layer.data[li].uv = new_uv
+
+        self.report({'INFO'}, f"Removed {removed} unused color(s); {len(new_manifest)} remain")
+        return {'FINISHED'}
+
+
 # ----------------------------------------------------------------------------
 # UI
 # ----------------------------------------------------------------------------
@@ -493,14 +730,38 @@ class VIEW3D_PT_color_grid(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+        s = context.scene.mcg_settings
 
         box = layout.box()
         box.label(text="Bake / Update", icon='TEXTURE')
-        box.operator(
-            OBJECT_OT_material_color_grid.bl_idname,
-            text="Bake Selected to Grid",
-        )
-        box.label(text="Select objects, then bake.", icon='INFO')
+        box.prop(s, "grid_name")
+        box.prop(s, "minimal_resolution")
+        if s.minimal_resolution:
+            box.prop(s, "cell_pixels")
+        else:
+            box.prop(s, "resolution")
+        col = box.column(align=True)
+        col.prop(s, "create_vertex_groups")
+        col.prop(s, "remap_uvs")
+        col.prop(s, "replace_materials")
+        col.prop(s, "sync_all_users")
+        op = box.operator(OBJECT_OT_material_color_grid.bl_idname, text="Bake Selected to Grid")
+        op.group_name = s.grid_name
+        op.resolution = s.resolution
+        op.minimal_resolution = s.minimal_resolution
+        op.cell_pixels = s.cell_pixels
+        op.create_vertex_groups = s.create_vertex_groups
+        op.remap_uvs = s.remap_uvs
+        op.replace_materials = s.replace_materials
+        op.sync_all_users = s.sync_all_users
+
+        box = layout.box()
+        box.label(text="Tools", icon='TOOL_SETTINGS')
+        op = box.operator(OBJECT_OT_rename_grid.bl_idname, text="Rename Current Grid")
+        op.new_name = s.grid_name
+        box.operator(OBJECT_OT_select_grid_users.bl_idname, text="Select Objects Using Grid")
+        box.operator(OBJECT_OT_compact_grid.bl_idname, text="Compact Grid (Remove Unused)")
+        box.operator(OBJECT_OT_export_grid_png.bl_idname, text="Export Texture (PNG)")
 
         box = layout.box()
         box.label(text="Reverse", icon='MATERIAL')
@@ -508,7 +769,6 @@ class VIEW3D_PT_color_grid(bpy.types.Panel):
             OBJECT_OT_restore_materials_from_grid.bl_idname,
             text="Restore Materials",
         )
-        box.label(text="Rebuild per-color materials.", icon='INFO')
 
 
 def menu_func(self, context):
@@ -518,8 +778,13 @@ def menu_func(self, context):
 
 
 classes = (
+    MCGSettings,
     OBJECT_OT_material_color_grid,
     OBJECT_OT_restore_materials_from_grid,
+    OBJECT_OT_rename_grid,
+    OBJECT_OT_select_grid_users,
+    OBJECT_OT_compact_grid,
+    OBJECT_OT_export_grid_png,
     VIEW3D_PT_color_grid,
 )
 
@@ -527,11 +792,13 @@ classes = (
 def register():
     for c in classes:
         bpy.utils.register_class(c)
+    bpy.types.Scene.mcg_settings = bpy.props.PointerProperty(type=MCGSettings)
     bpy.types.VIEW3D_MT_object.append(menu_func)
 
 
 def unregister():
     bpy.types.VIEW3D_MT_object.remove(menu_func)
+    del bpy.types.Scene.mcg_settings
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
 
