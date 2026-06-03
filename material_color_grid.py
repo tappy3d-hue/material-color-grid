@@ -4,9 +4,9 @@ bl_info = {
     "version": (1, 0, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Object Menu / F3 Search",
-    "description": "Create a grid texture from object material base colors, "
-                   "assign a new material, and store original material assignment "
-                   "as vertex groups.",
+    "description": "Pool base colors from all selected objects into one shared "
+                   "grid texture and material (meshes stay separate), and store "
+                   "original material assignment as vertex groups.",
     "category": "Material",
 }
 
@@ -188,108 +188,104 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'MESH'
+        return any(o.type == 'MESH' for o in context.selected_objects)
 
     def execute(self, context):
-        obj = context.active_object
-        mesh = obj.data
-
-        if not obj.material_slots:
-            self.report({'ERROR'}, "Active object has no material slots")
+        # ---- Gather all selected mesh objects ----
+        mesh_objects = [o for o in context.selected_objects if o.type == 'MESH']
+        if not mesh_objects:
+            self.report({'ERROR'}, "No mesh objects selected")
             return {'CANCELLED'}
 
-        # ---- Collect unique materials (in slot order) ----
-        unique_mats = []          # ordered list of materials
+        # ---- Build a GLOBAL unique material list across ALL selected objects ----
+        unique_mats = []          # ordered list of materials (shared across objects)
         mat_name_to_index = {}    # material name -> index in unique_mats
-        for slot in obj.material_slots:
-            mat = slot.material
-            if mat is None:
-                continue
-            if mat.name in mat_name_to_index:
-                continue
-            mat_name_to_index[mat.name] = len(unique_mats)
-            unique_mats.append(mat)
+        for obj in mesh_objects:
+            for slot in obj.material_slots:
+                mat = slot.material
+                if mat is None or mat.name in mat_name_to_index:
+                    continue
+                mat_name_to_index[mat.name] = len(unique_mats)
+                unique_mats.append(mat)
 
         if not unique_mats:
-            self.report({'ERROR'}, "No valid materials found in slots")
+            self.report({'ERROR'}, "No valid materials found on selected objects")
             return {'CANCELLED'}
 
-        # ---- Map slot index -> unique material index ----
-        slot_to_uniq = {}
-        for slot_idx, slot in enumerate(obj.material_slots):
-            mat = slot.material
-            if mat is None:
-                continue
-            slot_to_uniq[slot_idx] = mat_name_to_index[mat.name]
-
-        # ---- Create vertex groups (per material name) ----
-        if self.create_vertex_groups:
-            # material name -> set of vertex indices
-            mat_to_verts = {m.name: set() for m in unique_mats}
-            for poly in mesh.polygons:
-                uniq_idx = slot_to_uniq.get(poly.material_index)
-                if uniq_idx is None:
-                    continue
-                mat_name = unique_mats[uniq_idx].name
-                mat_to_verts[mat_name].update(poly.vertices)
-
-            for mat_name, verts in mat_to_verts.items():
-                if not verts:
-                    continue
-                # Remove existing same-name group to keep it clean
-                existing = obj.vertex_groups.get(mat_name)
-                if existing is not None:
-                    obj.vertex_groups.remove(existing)
-                vg = obj.vertex_groups.new(name=mat_name)
-                vg.add(list(verts), 1.0, 'REPLACE')
-
-        # ---- Build the texture image ----
+        # ---- Build ONE shared texture + ONE shared material ----
         colors = [get_base_color(m) for m in unique_mats]
-        img_name = f"{obj.name}_ColorGrid"
+        img_name = "SharedColorGrid"
         image, uv_centers, cols, rows = create_grid_image(
             img_name, colors, self.resolution
         )
-
-        # ---- Remap UVs so each face points at its original color cell ----
-        # (Do this BEFORE clearing materials, since we still need material_index.)
-        if self.remap_uvs:
-            uv_layer_name = "ColorGridUV"
-
-            # Remove ALL existing UV maps so only the new one remains.
-            # uv_layers.remove() invalidates indices, so loop until empty.
-            while mesh.uv_layers:
-                mesh.uv_layers.remove(mesh.uv_layers[0])
-
-            uv_layer = mesh.uv_layers.new(name=uv_layer_name)
-            # Make it the active UV map AND the active-for-rendering UV map
-            mesh.uv_layers.active = uv_layer
-            uv_layer.active_render = True
-
-            for poly in mesh.polygons:
-                uniq_idx = slot_to_uniq.get(poly.material_index)
-                uv = uv_centers[uniq_idx] if uniq_idx is not None else (0.5, 0.5)
-                for loop_idx in poly.loop_indices:
-                    uv_layer.data[loop_idx].uv = uv
-
-        # ---- Build the new material ----
-        new_mat_name = f"{obj.name}_ColorGridMat"
+        new_mat_name = "SharedColorGridMat"
         new_mat = build_grid_material(new_mat_name, image)
 
-        # ---- Assign the new material ----
-        if self.replace_materials:
-            mesh.materials.clear()
-            mesh.materials.append(new_mat)
-            for poly in mesh.polygons:
-                poly.material_index = 0
-        else:
-            # Append as additional slot; do not reassign faces
-            mesh.materials.append(new_mat)
+        # ---- Apply to each object (geometry stays separate) ----
+        processed_meshes = set()  # guard against linked-duplicate meshes
+        for obj in mesh_objects:
+            mesh = obj.data
+
+            # slot index -> global unique material index (for this object)
+            slot_to_uniq = {}
+            for slot_idx, slot in enumerate(obj.material_slots):
+                mat = slot.material
+                if mat is None:
+                    continue
+                slot_to_uniq[slot_idx] = mat_name_to_index[mat.name]
+
+            # Mesh-level edits (UVs, material slots) only once per shared mesh datablock
+            mesh_already_done = mesh.name in processed_meshes
+
+            # ---- Vertex groups (per object, by material name) ----
+            if self.create_vertex_groups:
+                mat_to_verts = {}
+                for poly in mesh.polygons:
+                    uniq_idx = slot_to_uniq.get(poly.material_index)
+                    if uniq_idx is None:
+                        continue
+                    name = unique_mats[uniq_idx].name
+                    mat_to_verts.setdefault(name, set()).update(poly.vertices)
+
+                for mat_name, verts in mat_to_verts.items():
+                    existing = obj.vertex_groups.get(mat_name)
+                    if existing is not None:
+                        obj.vertex_groups.remove(existing)
+                    vg = obj.vertex_groups.new(name=mat_name)
+                    vg.add(list(verts), 1.0, 'REPLACE')
+
+            if not mesh_already_done:
+                # ---- Remap UVs (before clearing materials) ----
+                if self.remap_uvs:
+                    while mesh.uv_layers:
+                        mesh.uv_layers.remove(mesh.uv_layers[0])
+                    uv_layer = mesh.uv_layers.new(name="ColorGridUV")
+                    mesh.uv_layers.active = uv_layer
+                    uv_layer.active_render = True
+
+                    for poly in mesh.polygons:
+                        uniq_idx = slot_to_uniq.get(poly.material_index)
+                        uv = uv_centers[uniq_idx] if uniq_idx is not None else (0.5, 0.5)
+                        for loop_idx in poly.loop_indices:
+                            uv_layer.data[loop_idx].uv = uv
+
+                # ---- Assign shared material ----
+                if self.replace_materials:
+                    mesh.materials.clear()
+                    mesh.materials.append(new_mat)
+                    for poly in mesh.polygons:
+                        poly.material_index = 0
+                else:
+                    if new_mat.name not in [m.name for m in mesh.materials if m]:
+                        mesh.materials.append(new_mat)
+
+                processed_meshes.add(mesh.name)
 
         self.report(
             {'INFO'},
             f"Grid {cols}x{rows} ({len(unique_mats)} colors, "
-            f"{cols * rows - len(unique_mats)} empty) -> '{new_mat_name}'"
+            f"{cols * rows - len(unique_mats)} empty) applied to "
+            f"{len(mesh_objects)} object(s) -> '{new_mat_name}'"
         )
         return {'FINISHED'}
 
