@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Material Color Grid Texture",
     "author": "Claude",
-    "version": (1, 7, 0),
+    "version": (1, 9, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > Color Grid tab",
     "description": "Pool base colors (and optionally roughness/metallic) from selected "
@@ -15,6 +15,8 @@ bl_info = {
 import bpy
 import math
 import json
+import os
+import random
 
 DEFAULT_GROUP_NAME = "ColorGrid"
 MANIFEST_KEY = "mcg_manifest"
@@ -29,6 +31,11 @@ MAP_SPEC = [
     ("roughness", "Roughness", "Roughness",  True, 120),
     ("metallic",  "Metallic",  "Metallic",   True, -160),
 ]
+
+
+def make_seed(length=6):
+    """Random lowercase-hex seed to make grid names unique across projects."""
+    return "".join(random.choice("0123456789abcdef") for _ in range(length))
 
 
 # ----------------------------------------------------------------------------
@@ -155,6 +162,11 @@ def paint_grid(img, cells, srgb):
 
     img.pixels = pixels
     img.update()
+    # If this image was previously exported/unpacked (source FILE), the stale PNG on
+    # disk could shadow these fresh pixels on reload. Re-internalize it so the freshly
+    # painted pixels are authoritative until the next explicit Export.
+    if img.source == 'FILE':
+        img.source = 'GENERATED'
     img.pack()
 
 
@@ -388,7 +400,9 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
 
         # Resolve material
         if shared_mat is None:
-            base = (self.group_name or DEFAULT_GROUP_NAME).strip() or DEFAULT_GROUP_NAME
+            raw = (self.group_name or "").strip()
+            seed = make_seed()
+            base = (raw + "_" + seed) if raw else seed
             shared_mat = bpy.data.materials.new(name=base + "_Mat")
         else:
             base = None  # reuse existing image names
@@ -503,19 +517,50 @@ class OBJECT_OT_restore_materials_from_grid(bpy.types.Operator):
     def poll(cls, context):
         return any(o.type == 'MESH' for o in context.selected_objects)
 
+    @staticmethod
+    def _matches(mat, rgba, rough, metal, tol=1e-4):
+        """True if an existing material already has these values (safe to reuse)."""
+        bsdf = _principled(mat)
+        if bsdf is None:
+            return False
+        bc = bsdf.inputs.get("Base Color")
+        if bc is None:
+            return False
+        v = bc.default_value
+        if any(abs(v[i] - rgba[i]) > tol for i in range(3)):
+            return False
+        ri = bsdf.inputs.get("Roughness")
+        if ri is not None and abs(float(ri.default_value) - rough) > tol:
+            return False
+        mi = bsdf.inputs.get("Metallic")
+        if mi is not None and abs(float(mi.default_value) - metal) > tol:
+            return False
+        return True
+
     def _build_material(self, entry):
         name = entry["name"]
         col = entry["color"]
         rgba = (col[0], col[1], col[2], col[3] if len(col) > 3 else 1.0)
-        mat = bpy.data.materials.get(name) or bpy.data.materials.new(name=name)
+        rough = float(entry.get("roughness", 0.5))
+        metal = float(entry.get("metallic", 0.0))
+
+        # Reuse an existing same-name material ONLY if it already matches (no overwrite).
+        existing = bpy.data.materials.get(name)
+        if existing is not None and self._matches(existing, rgba, rough, metal):
+            return existing
+
+        # Otherwise create a new material. If the name is taken by a different
+        # material, Blender appends a numeric suffix (e.g. ".001") automatically,
+        # so the existing one is never modified.
+        mat = bpy.data.materials.new(name=name)
         mat.use_nodes = True
         bsdf = _principled(mat)
         if bsdf is not None:
             bsdf.inputs["Base Color"].default_value = rgba
             if bsdf.inputs.get("Roughness") is not None:
-                bsdf.inputs["Roughness"].default_value = float(entry.get("roughness", 0.5))
+                bsdf.inputs["Roughness"].default_value = rough
             if bsdf.inputs.get("Metallic") is not None:
-                bsdf.inputs["Metallic"].default_value = float(entry.get("metallic", 0.0))
+                bsdf.inputs["Metallic"].default_value = metal
         mat.diffuse_color = rgba
         return mat
 
@@ -734,6 +779,8 @@ class OBJECT_OT_export_grid_png(bpy.types.Operator):
             self.report({'ERROR'}, "Selected objects don't use a grid material with textures")
             return {'CANCELLED'}
         base = imgs.get("color")
+        # Default to the image's unique datablock name: stable per grid, distinct
+        # between different grids, so re-exporting updates the SAME files.
         self.filepath = ((base.name if base else "ColorGrid")) + ".png"
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
@@ -745,17 +792,15 @@ class OBJECT_OT_export_grid_png(bpy.types.Operator):
             return {'CANCELLED'}
 
         path = self.filepath
-        if path.lower().endswith(".png"):
-            stem = path[:-4]
-        else:
-            stem = path
+        stem = path[:-4] if path.lower().endswith(".png") else path
         suffix = {"color": "", "roughness": "_Rough", "metallic": "_Metal"}
+        present = [k for k in ("color", "roughness", "metallic") if imgs.get(k) is not None]
 
+        # Grid names carry a random seed, so different grids never share a filename.
+        # Re-exporting the same grid overwrites its own files (the intended update).
         saved = 0
-        for key in ("color", "roughness", "metallic"):
-            img = imgs.get(key)
-            if img is None:
-                continue
+        for key in present:
+            img = imgs[key]
             out = stem + suffix[key] + ".png"
             img.filepath_raw = out
             img.file_format = 'PNG'
@@ -775,7 +820,8 @@ class OBJECT_OT_export_grid_png(bpy.types.Operator):
             saved += 1
 
         note = " (unpacked)" if self.reference_after_export else ""
-        self.report({'INFO'}, f"Saved {saved} texture(s){note} next to {stem}.png")
+        self.report({'INFO'},
+                    f"Saved/updated {saved} texture(s){note} as {os.path.basename(stem)}.png")
         return {'FINISHED'}
 
 
