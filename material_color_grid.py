@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Material Color Grid Texture",
     "author": "Claude",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > Color Grid tab",
     "description": "Pool base colors from selected objects into one shared grid "
@@ -16,8 +16,7 @@ import bpy
 import math
 import json
 
-SHARED_IMG_NAME = "SharedColorGrid"
-SHARED_MAT_NAME = "SharedColorGridMat"
+DEFAULT_GROUP_NAME = "ColorGrid"
 MANIFEST_KEY = "mcg_manifest"   # custom property on the shared material
 UV_LAYER_NAME = "ColorGridUV"
 
@@ -78,13 +77,18 @@ def uv_to_cell_index(u, v, cols, rows):
 # Image / material helpers
 # ----------------------------------------------------------------------------
 
-def ensure_image(width, height):
-    """Get the shared image datablock, creating or resizing as needed."""
-    img = bpy.data.images.get(SHARED_IMG_NAME)
-    if img is None:
-        img = bpy.data.images.new(SHARED_IMG_NAME, width=width, height=height, alpha=True)
-    elif img.size[0] != width or img.size[1] != height:
-        img.scale(width, height)
+def get_material_image(mat):
+    """Return the image used by the material's first Image Texture node, or None."""
+    if mat.use_nodes and mat.node_tree:
+        for n in mat.node_tree.nodes:
+            if n.type == 'TEX_IMAGE' and n.image is not None:
+                return n.image
+    return None
+
+
+def new_grid_image(name, width, height):
+    """Create a fresh sRGB image; Blender auto-uniquifies the name if taken."""
+    img = bpy.data.images.new(name, width=width, height=height, alpha=True)
     img.colorspace_settings.name = 'sRGB'
     return img
 
@@ -210,6 +214,13 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
         description="Output texture resolution (square)",
         default=512, min=16, max=8192,
     )
+    group_name: bpy.props.StringProperty(
+        name="Group Name",
+        description="Name for a NEW grid's texture and material. Ignored when updating "
+                    "an existing grid (the selected object's existing texture is reused). "
+                    "If the name already exists, a number suffix is added automatically",
+        default=DEFAULT_GROUP_NAME,
+    )
     create_vertex_groups: bpy.props.BoolProperty(
         name="Create Vertex Groups",
         description="Create a vertex group per original material so you can re-select faces later",
@@ -277,15 +288,21 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
             self.report({'ERROR'}, "No valid materials found on selected objects")
             return {'CANCELLED'}
 
-        # ---- (Re)build the texture and shared material ----
-        img = ensure_image(self.resolution, self.resolution)
+        # ---- Resolve the texture image and shared material ----
+        if shared_mat is None:
+            # Fresh grid: create uniquely-named image + material from group_name.
+            name = (self.group_name or DEFAULT_GROUP_NAME).strip() or DEFAULT_GROUP_NAME
+            img = new_grid_image(name, self.resolution, self.resolution)
+            shared_mat = bpy.data.materials.new(name=name + "_Mat")
+        else:
+            # Update mode: reuse the material's existing image (keep its name/size).
+            img = get_material_image(shared_mat)
+            if img is None:
+                img = new_grid_image(shared_mat.name + "_Tex", self.resolution, self.resolution)
+
         colors_linear = [tuple(e["color"]) for e in manifest]
         uv_centers, new_cols, new_rows = write_grid_pixels(img, colors_linear)
 
-        if shared_mat is None:
-            shared_mat = bpy.data.materials.get(SHARED_MAT_NAME)
-            if shared_mat is None:
-                shared_mat = bpy.data.materials.new(name=SHARED_MAT_NAME)
         get_or_make_tex_node(shared_mat, img)
         write_manifest(shared_mat, manifest)
 
