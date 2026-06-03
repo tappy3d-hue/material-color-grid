@@ -1,46 +1,84 @@
 # Material Color Grid Texture
 
-A Blender add-on that bakes the Base Color of each material on an object into a single grid texture, builds a new material that uses it, and stores the original material assignment as vertex groups so you can re-select faces later.
+選択した複数オブジェクトのマテリアルのBase Colorを **1枚の共有グリッドテクスチャ** にまとめ、共有マテリアルとして全オブジェクトに割り当てるBlenderアドオンです。メッシュは結合されず分割されたままで、元のマテリアル割り当ては頂点グループとして保存されます。
+
+再実行で **色を追加（インクリメンタル更新）** したり、グリッドから **元のマテリアルを復元** することもできます。主にBlender → Roblox Studio 移行で、テクスチャアセットの枚数を最小化する用途を想定しています。
 
 ![grid example](docs/example.png)
 
-## What it does
+## 主な機能
 
-Given a mesh with several materials:
+- 選択オブジェクト全体から Base Color を集約して1枚のグリッドテクスチャを生成
+- 後から別のオブジェクトを追加しても、既存の色を保持したまま新しい色を追加して更新
+- グリッドテクスチャから元の色ごとのマテリアルを復元（焼き戻しの逆）
+- 元のマテリアル名で頂点グループを作成し、後から面を再選択可能
 
-1. Collects the **Principled BSDF → Base Color** of every material slot.
-2. Generates a square texture split into a `ceil(√n) × ceil(n/cols)` grid of solid colors (e.g. 4 mats → 2×2, 10 mats → 4×3 with 2 empty cells).
-3. Creates a new material with that texture (Image Texture → Principled BSDF, `Closest` interpolation) and assigns it.
-4. Optionally creates a new UV map (`ColorGridUV`) where every face is mapped to its original material's color cell — so the result visually matches the original — and removes all other UV maps.
-5. Optionally creates one vertex group per original material name, containing the verts of the faces that used it, so you can re-select them via `Select → Vertex Group`.
+## インストール
 
-Color values are linear→sRGB-encoded before being written, so the sampled color in the new shader matches the original Base Color exactly.
+1. `material_color_grid.py` をダウンロード（ファイル名にドットを入れないこと）
+2. Blender で `編集 → プリファレンス → アドオン → インストール...`
+3. `.py` ファイルを選んで、チェックボックスを有効化
 
-## Installation
+Blender 3.x / 4.x で動作確認しています。
 
-1. Download `material_color_grid.py` (or this repo as a zip).
-2. In Blender: `Edit → Preferences → Add-ons → Install...`
-3. Pick the `.py` file and enable the checkbox.
+## UI
 
-Tested on Blender 3.x and 4.x.
+有効化すると、3Dビューポートのサイドバー（`N` キーで開閉）に **「Color Grid」タブ** が追加されます。
+ここから以下の操作ができます（`F3` 検索や `オブジェクト` メニューからも実行可能）。
 
-## Usage
+- **Bake Selected to Grid** — 選択オブジェクトをグリッドテクスチャに焼く／更新する
+- **Restore Materials** — グリッドから元のマテリアルを復元する
 
-1. Select a mesh object that has multiple materials.
-2. `Object` menu → **Material Color Grid Texture**, or press `F3` and search for it.
-3. Tweak options in the Redo panel (bottom-left):
-   - **Resolution** — texture size (square)
-   - **Create Vertex Groups** — one group per original material name
-   - **Remap UVs to Color Cells** — replace UV maps with a new one pointing at each face's color cell
-   - **Replace Material Slots** — wipe old slots and assign only the new grid material
+実行後、左下のやり直しパネル（Redoパネル）でオプションを調整できます。
 
-## Notes
+## 使い方
 
-- Same material used in multiple slots is collapsed to a single cell.
-- Materials without a Principled BSDF fall back to the viewport diffuse color.
-- The generated image is packed into the .blend; export it with `Image → Save As` if you need an external file.
-- Vertex groups are created with weight 1.0 on every vertex of the relevant faces; verts on material boundaries will belong to multiple groups.
+### 1. グリッドに焼く（初回）
 
-## License
+1. 色をまとめたいメッシュオブジェクトを複数選択
+2. サイドバー「Color Grid」→ **Bake Selected to Grid**
+3. Redoパネルでオプション調整：
+   - **Resolution** — テクスチャの解像度（正方形）
+   - **Create Vertex Groups** — 元のマテリアル名で頂点グループを作成
+   - **Remap UVs to Color Cells** — UVマップを置き換えて各面を対応する色セルに飛ばす
+   - **Replace Material Slots** — 既存スロットを全削除して共有マテリアルだけにする
 
-MIT — see [LICENSE](LICENSE).
+全オブジェクトをまたいでユニークな色だけが集約され、`ceil(√n) × ceil(n/cols)` のグリッドテクスチャ（例：4色 → 2×2、10色 → 4×3で2マス空き）が `SharedColorGrid` として1枚だけ生成され、`SharedColorGridMat` が割り当てられます。**ジオメトリは結合されず、メッシュは分割されたままです。**
+
+### 2. 色を追加して更新（2回目以降）
+
+すでにグリッドが適用されたオブジェクトと、まだ元のマテリアルを持つオブジェクトを **一緒に選択** して **Bake Selected to Grid** を実行すると：
+
+1. 既存の共有マテリアルに保存された台帳（マニフェスト）から既存の色をすべて保持
+2. 新しいオブジェクトのBase Colorを末尾に追加
+3. テクスチャを作り直し
+4. 既存オブジェクトのUVを新しいグリッドレイアウトに自動で貼り直し（色は維持されたまま追従）
+
+- **Update All Objects Using Texture**（デフォルトON）  
+  グリッドの分割数が変わると、選択していない既存オブジェクトもセル位置がズレます。ONにしておくと、ファイル内でその共有テクスチャを使っている全オブジェクトのUVを自動で貼り直すため、選択し忘れた既存モデルも色が崩れません。
+
+色の並び順（インデックス）は常に維持され、新色は末尾に追加されるだけなので、既存の色は同じ内容のまま新レイアウトに正しく追従します。
+
+### 3. マテリアルを復元する（逆変換）
+
+グリッドが適用されたオブジェクトを選択して **Restore Materials** を実行すると：
+
+1. 各面のUVから対応する色セルを判定
+2. マニフェストの色・名前をもとに、色ごとのマテリアル（Principled BSDF）を再生成
+3. 各面に元のマテリアルを割り当て直し
+
+これでテクスチャ方式から、個別マテリアル方式（JSON移行向けなど）に戻せます。
+
+## 補足
+
+- 生成物は `SharedColorGrid`（テクスチャ）と `SharedColorGridMat`（マテリアル）の固定名です。
+- マニフェスト（色の台帳）は共有マテリアルのカスタムプロパティ `mcg_manifest` として .blend に保存され、ファイルを開き直しても引き継がれます。
+- 同じ名前のマテリアルが既にマニフェストにある場合は、セルを増やさずそのセルの色を最新値に更新します。
+- Principled BSDFが無いマテリアルはビューポートのdiffuse colorにフォールバックします。
+- リンク複製（同じメッシュデータを共有するオブジェクト）は二重処理されないようガードしています。
+- 生成画像は .blend にパックされます。外部ファイルとして必要なら `画像 → 名前を付けて保存` で書き出してください。
+- 色は linear → sRGB エンコードして書き込むので、レンダー結果が元のBase Colorと一致します。
+
+## ライセンス
+
+MIT — 詳細は [LICENSE](LICENSE) を参照

@@ -1,25 +1,32 @@
 bl_info = {
     "name": "Material Color Grid Texture",
     "author": "Claude",
-    "version": (1, 0, 0),
+    "version": (1, 2, 0),
     "blender": (3, 0, 0),
-    "location": "View3D > Object Menu / F3 Search",
-    "description": "Create a grid texture from object material base colors, "
-                   "assign a new material, and store original material assignment "
-                   "as vertex groups.",
+    "location": "View3D > Sidebar (N) > Color Grid tab",
+    "description": "Pool base colors from selected objects into one shared grid "
+                   "texture and material (meshes stay separate). Re-running adds "
+                   "new colors while preserving previously baked ones via a stored "
+                   "manifest. Can also restore per-color materials from the grid. "
+                   "Original material assignment is saved as vertex groups.",
     "category": "Material",
 }
 
 import bpy
 import math
+import json
+
+SHARED_IMG_NAME = "SharedColorGrid"
+SHARED_MAT_NAME = "SharedColorGridMat"
+MANIFEST_KEY = "mcg_manifest"   # custom property on the shared material
+UV_LAYER_NAME = "ColorGridUV"
 
 
 # ----------------------------------------------------------------------------
-# Helpers
+# Color / grid helpers
 # ----------------------------------------------------------------------------
 
 def linear_to_srgb_channel(c):
-    """Convert a single linear channel to sRGB."""
     if c < 0.0:
         return 0.0
     if c <= 0.0031308:
@@ -30,7 +37,6 @@ def linear_to_srgb_channel(c):
 def get_base_color(mat):
     """Get Base Color from Principled BSDF (linear RGBA). Fallback to viewport diffuse."""
     if mat.use_nodes and mat.node_tree:
-        # Prefer the node connected to Material Output's surface
         for node in mat.node_tree.nodes:
             if node.type == 'BSDF_PRINCIPLED':
                 base_input = node.inputs.get("Base Color")
@@ -50,60 +56,66 @@ def calculate_grid(n):
     return cols, rows
 
 
-def create_grid_image(name, colors_linear, resolution=512):
-    """
-    Create a packed image with a grid of solid colors.
+def cell_uv_center(idx, cols, rows):
+    col = idx % cols
+    row = idx // cols
+    u = (col + 0.5) / cols
+    v = (rows - 1 - row + 0.5) / rows
+    return (u, v)
 
-    colors_linear: list of (r,g,b,a) in linear space.
-    Returns: (image, uv_centers, cols, rows)
-        uv_centers[i] = (u, v) center of the i-th cell, in UV space (0..1)
-    """
+
+def uv_to_cell_index(u, v, cols, rows):
+    """Inverse of cell_uv_center: which cell does this UV fall in."""
+    col = min(int(u * cols), cols - 1)
+    col = max(col, 0)
+    row_from_bottom = min(int(v * rows), rows - 1)
+    row_from_bottom = max(row_from_bottom, 0)
+    row = rows - 1 - row_from_bottom
+    return row * cols + col
+
+
+# ----------------------------------------------------------------------------
+# Image / material helpers
+# ----------------------------------------------------------------------------
+
+def ensure_image(width, height):
+    """Get the shared image datablock, creating or resizing as needed."""
+    img = bpy.data.images.get(SHARED_IMG_NAME)
+    if img is None:
+        img = bpy.data.images.new(SHARED_IMG_NAME, width=width, height=height, alpha=True)
+    elif img.size[0] != width or img.size[1] != height:
+        img.scale(width, height)
+    img.colorspace_settings.name = 'sRGB'
+    return img
+
+
+def write_grid_pixels(img, colors_linear):
+    """Paint the grid of solid colors onto the image. Returns (uv_centers, cols, rows)."""
+    width, height = img.size
     n = len(colors_linear)
     cols, rows = calculate_grid(n)
 
-    width = resolution
-    height = resolution
-
-    # Remove existing image with same name to avoid orphan accumulation
-    if name in bpy.data.images:
-        bpy.data.images.remove(bpy.data.images[name])
-
-    img = bpy.data.images.new(name, width=width, height=height, alpha=True)
-    img.colorspace_settings.name = 'sRGB'
-
-    # Initialize all pixels to transparent black
     pixels = [0.0] * (width * height * 4)
+    encoded = [(
+        linear_to_srgb_channel(r),
+        linear_to_srgb_channel(g),
+        linear_to_srgb_channel(b),
+        a,
+    ) for (r, g, b, a) in colors_linear]
 
-    # Convert colors to sRGB-encoded values so that when Blender samples this
-    # sRGB image and decodes it back to linear, we recover the original linear
-    # base color used by Principled BSDF.
-    encoded_colors = []
-    for (r, g, b, a) in colors_linear:
-        encoded_colors.append((
-            linear_to_srgb_channel(r),
-            linear_to_srgb_channel(g),
-            linear_to_srgb_channel(b),
-            a,
-        ))
-
-    for idx, color in enumerate(encoded_colors):
+    for idx, (r, g, b, a) in enumerate(encoded):
         col = idx % cols
-        row = idx // cols  # row 0 = top
-
-        # Blender image origin is bottom-left, so flip row
+        row = idx // cols
         row_from_bottom = rows - 1 - row
-
-        x_start = (col * width) // cols
-        x_end = ((col + 1) * width) // cols
-        y_start = (row_from_bottom * height) // rows
-        y_end = ((row_from_bottom + 1) * height) // rows
-
-        r, g, b, a = color
-        for y in range(y_start, y_end):
-            row_offset = y * width * 4
-            for x in range(x_start, x_end):
-                i = row_offset + x * 4
-                pixels[i]     = r
+        x0 = (col * width) // cols
+        x1 = ((col + 1) * width) // cols
+        y0 = (row_from_bottom * height) // rows
+        y1 = ((row_from_bottom + 1) * height) // rows
+        for y in range(y0, y1):
+            ro = y * width * 4
+            for x in range(x0, x1):
+                i = ro + x * 4
+                pixels[i] = r
                 pixels[i + 1] = g
                 pixels[i + 2] = b
                 pixels[i + 3] = a
@@ -112,23 +124,12 @@ def create_grid_image(name, colors_linear, resolution=512):
     img.update()
     img.pack()
 
-    uv_centers = []
-    for idx in range(n):
-        col = idx % cols
-        row = idx // cols
-        u = (col + 0.5) / cols
-        v = (rows - 1 - row + 0.5) / rows
-        uv_centers.append((u, v))
-
-    return img, uv_centers, cols, rows
+    uv_centers = [cell_uv_center(i, cols, rows) for i in range(n)]
+    return uv_centers, cols, rows
 
 
-def build_grid_material(name, image):
-    """Build a simple material using Principled BSDF + Image Texture (Closest)."""
-    if name in bpy.data.materials:
-        bpy.data.materials.remove(bpy.data.materials[name])
-
-    mat = bpy.data.materials.new(name=name)
+def get_or_make_tex_node(mat, image):
+    """Ensure the material has an Image Texture node feeding Base Color, pointing at image."""
     mat.use_nodes = True
     nt = mat.node_tree
     nodes = nt.nodes
@@ -136,17 +137,62 @@ def build_grid_material(name, image):
 
     bsdf = nodes.get("Principled BSDF")
     if bsdf is None:
+        for node in nodes:
+            if node.type == 'BSDF_PRINCIPLED':
+                bsdf = node
+                break
+    if bsdf is None:
         bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
 
-    tex = nodes.new(type='ShaderNodeTexImage')
+    tex = None
+    for node in nodes:
+        if node.type == 'TEX_IMAGE':
+            tex = node
+            break
+    if tex is None:
+        tex = nodes.new(type='ShaderNodeTexImage')
+        tex.location = (-340, 300)
+
     tex.image = image
-    tex.interpolation = 'Closest'  # sharp cell boundaries
-    tex.location = (-340, 300)
+    tex.interpolation = 'Closest'
+    links.new(tex.outputs['Color'], bsdf.inputs['Base Color'])
+    return tex
 
-    if bsdf is not None:
-        links.new(tex.outputs['Color'], bsdf.inputs['Base Color'])
 
-    return mat
+def find_shared_material_from(objs):
+    """Return the shared grid material (carrying a manifest) used by any of objs, or None."""
+    for obj in objs:
+        for slot in obj.material_slots:
+            mat = slot.material
+            if mat is not None and MANIFEST_KEY in mat:
+                return mat
+    return None
+
+
+def read_manifest(mat):
+    """Return ordered list of {'name':..., 'color':[r,g,b,a]} from material, or []."""
+    raw = mat.get(MANIFEST_KEY)
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+
+
+def write_manifest(mat, manifest):
+    mat[MANIFEST_KEY] = json.dumps(manifest)
+
+
+def objects_using_material(mat):
+    """All mesh objects in the file whose mesh references mat."""
+    result = []
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+        if any(m == mat for m in obj.data.materials):
+            result.append(obj)
+    return result
 
 
 # ----------------------------------------------------------------------------
@@ -154,7 +200,7 @@ def build_grid_material(name, image):
 # ----------------------------------------------------------------------------
 
 class OBJECT_OT_material_color_grid(bpy.types.Operator):
-    """Create a grid color texture from this object's materials and assign it"""
+    """Bake selected objects' material base colors into one shared grid texture"""
     bl_idname = "object.material_color_grid"
     bl_label = "Material Color Grid Texture"
     bl_options = {'REGISTER', 'UNDO'}
@@ -162,135 +208,258 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
     resolution: bpy.props.IntProperty(
         name="Resolution",
         description="Output texture resolution (square)",
-        default=512,
-        min=16,
-        max=8192,
+        default=512, min=16, max=8192,
     )
-
     create_vertex_groups: bpy.props.BoolProperty(
         name="Create Vertex Groups",
         description="Create a vertex group per original material so you can re-select faces later",
         default=True,
     )
-
     remap_uvs: bpy.props.BoolProperty(
         name="Remap UVs to Color Cells",
-        description="Create a new UV map where each face is mapped to its original material's color cell "
-                    "(useful so the new material visually matches the original; you can re-UV later)",
+        description="Map each face to its material's color cell (replaces existing UV maps)",
         default=True,
     )
-
     replace_materials: bpy.props.BoolProperty(
         name="Replace Material Slots",
-        description="Remove all existing material slots and assign only the new grid material",
+        description="Remove existing material slots and assign only the shared grid material",
+        default=True,
+    )
+    sync_all_users: bpy.props.BoolProperty(
+        name="Update All Objects Using Texture",
+        description="When updating an existing grid, remap UVs of ALL objects in the file that use "
+                    "the shared texture (not just selected ones), so their colors stay correct after "
+                    "the grid layout changes",
         default=True,
     )
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'MESH'
+        return any(o.type == 'MESH' for o in context.selected_objects)
 
     def execute(self, context):
-        obj = context.active_object
-        mesh = obj.data
-
-        if not obj.material_slots:
-            self.report({'ERROR'}, "Active object has no material slots")
+        sel = [o for o in context.selected_objects if o.type == 'MESH']
+        if not sel:
+            self.report({'ERROR'}, "No mesh objects selected")
             return {'CANCELLED'}
 
-        # ---- Collect unique materials (in slot order) ----
-        unique_mats = []          # ordered list of materials
-        mat_name_to_index = {}    # material name -> index in unique_mats
-        for slot in obj.material_slots:
-            mat = slot.material
-            if mat is None:
-                continue
-            if mat.name in mat_name_to_index:
-                continue
-            mat_name_to_index[mat.name] = len(unique_mats)
-            unique_mats.append(mat)
+        # ---- Detect existing shared grid (update mode) ----
+        shared_mat = find_shared_material_from(sel)
+        manifest = read_manifest(shared_mat) if shared_mat else []
+        old_count = len(manifest)
+        old_cols, old_rows = calculate_grid(old_count) if old_count else (1, 1)
 
-        if not unique_mats:
-            self.report({'ERROR'}, "No valid materials found in slots")
+        name_to_index = {e["name"]: i for i, e in enumerate(manifest)}
+
+        # ---- Classify selected objects ----
+        existing_objs = []  # already use the shared material
+        source_objs = []    # carry original (to-be-added) materials
+        for obj in sel:
+            uses_shared = shared_mat is not None and any(
+                slot.material == shared_mat for slot in obj.material_slots
+            )
+            (existing_objs if uses_shared else source_objs).append(obj)
+
+        # ---- Merge new colors from source objects into manifest ----
+        for obj in source_objs:
+            for slot in obj.material_slots:
+                mat = slot.material
+                if mat is None or mat == shared_mat:
+                    continue
+                color = list(get_base_color(mat))
+                if mat.name in name_to_index:
+                    manifest[name_to_index[mat.name]]["color"] = color  # refresh
+                else:
+                    name_to_index[mat.name] = len(manifest)
+                    manifest.append({"name": mat.name, "color": color})
+
+        if not manifest:
+            self.report({'ERROR'}, "No valid materials found on selected objects")
             return {'CANCELLED'}
 
-        # ---- Map slot index -> unique material index ----
-        slot_to_uniq = {}
-        for slot_idx, slot in enumerate(obj.material_slots):
-            mat = slot.material
-            if mat is None:
+        # ---- (Re)build the texture and shared material ----
+        img = ensure_image(self.resolution, self.resolution)
+        colors_linear = [tuple(e["color"]) for e in manifest]
+        uv_centers, new_cols, new_rows = write_grid_pixels(img, colors_linear)
+
+        if shared_mat is None:
+            shared_mat = bpy.data.materials.get(SHARED_MAT_NAME)
+            if shared_mat is None:
+                shared_mat = bpy.data.materials.new(name=SHARED_MAT_NAME)
+        get_or_make_tex_node(shared_mat, img)
+        write_manifest(shared_mat, manifest)
+
+        # ---- Remap EXISTING textured objects (old layout -> new layout) ----
+        # Index order is preserved, so we only need to re-place by cell index.
+        layout_changed = (new_cols, new_rows) != (old_cols, old_rows)
+        if old_count and layout_changed:
+            targets = (objects_using_material(shared_mat)
+                       if self.sync_all_users else existing_objs)
+            done_meshes = set()
+            for obj in targets:
+                mesh = obj.data
+                if mesh.name in done_meshes:
+                    continue
+                done_meshes.add(mesh.name)
+                uv_layer = mesh.uv_layers.get(UV_LAYER_NAME) or mesh.uv_layers.active
+                if uv_layer is None:
+                    continue
+                for poly in mesh.polygons:
+                    li0 = poly.loop_indices[0]
+                    u, v = uv_layer.data[li0].uv
+                    idx = uv_to_cell_index(u, v, old_cols, old_rows)
+                    idx = min(idx, len(uv_centers) - 1)
+                    new_uv = uv_centers[idx]
+                    for loop_idx in poly.loop_indices:
+                        uv_layer.data[loop_idx].uv = new_uv
+
+        # ---- Apply to SOURCE objects (fresh bake) ----
+        processed = set()
+        for obj in source_objs:
+            mesh = obj.data
+
+            slot_to_idx = {}
+            for slot_idx, slot in enumerate(obj.material_slots):
+                mat = slot.material
+                if mat is None or mat == shared_mat:
+                    continue
+                slot_to_idx[slot_idx] = name_to_index[mat.name]
+
+            # vertex groups (per object, by material name)
+            if self.create_vertex_groups:
+                mat_to_verts = {}
+                for poly in mesh.polygons:
+                    if poly.material_index in slot_to_idx:
+                        mat_name = manifest[slot_to_idx[poly.material_index]]["name"]
+                        mat_to_verts.setdefault(mat_name, set()).update(poly.vertices)
+                for mat_name, verts in mat_to_verts.items():
+                    ex = obj.vertex_groups.get(mat_name)
+                    if ex is not None:
+                        obj.vertex_groups.remove(ex)
+                    vg = obj.vertex_groups.new(name=mat_name)
+                    vg.add(list(verts), 1.0, 'REPLACE')
+
+            if mesh.name in processed:
                 continue
-            slot_to_uniq[slot_idx] = mat_name_to_index[mat.name]
+            processed.add(mesh.name)
 
-        # ---- Create vertex groups (per material name) ----
-        if self.create_vertex_groups:
-            # material name -> set of vertex indices
-            mat_to_verts = {m.name: set() for m in unique_mats}
-            for poly in mesh.polygons:
-                uniq_idx = slot_to_uniq.get(poly.material_index)
-                if uniq_idx is None:
-                    continue
-                mat_name = unique_mats[uniq_idx].name
-                mat_to_verts[mat_name].update(poly.vertices)
+            if self.remap_uvs:
+                while mesh.uv_layers:
+                    mesh.uv_layers.remove(mesh.uv_layers[0])
+                uv_layer = mesh.uv_layers.new(name=UV_LAYER_NAME)
+                mesh.uv_layers.active = uv_layer
+                uv_layer.active_render = True
+                for poly in mesh.polygons:
+                    idx = slot_to_idx.get(poly.material_index)
+                    uv = uv_centers[idx] if idx is not None else (0.5, 0.5)
+                    for loop_idx in poly.loop_indices:
+                        uv_layer.data[loop_idx].uv = uv
 
-            for mat_name, verts in mat_to_verts.items():
-                if not verts:
-                    continue
-                # Remove existing same-name group to keep it clean
-                existing = obj.vertex_groups.get(mat_name)
-                if existing is not None:
-                    obj.vertex_groups.remove(existing)
-                vg = obj.vertex_groups.new(name=mat_name)
-                vg.add(list(verts), 1.0, 'REPLACE')
+            if self.replace_materials:
+                mesh.materials.clear()
+                mesh.materials.append(shared_mat)
+                for poly in mesh.polygons:
+                    poly.material_index = 0
+            else:
+                if shared_mat.name not in [m.name for m in mesh.materials if m]:
+                    mesh.materials.append(shared_mat)
 
-        # ---- Build the texture image ----
-        colors = [get_base_color(m) for m in unique_mats]
-        img_name = f"{obj.name}_ColorGrid"
-        image, uv_centers, cols, rows = create_grid_image(
-            img_name, colors, self.resolution
-        )
-
-        # ---- Remap UVs so each face points at its original color cell ----
-        # (Do this BEFORE clearing materials, since we still need material_index.)
-        if self.remap_uvs:
-            uv_layer_name = "ColorGridUV"
-
-            # Remove ALL existing UV maps so only the new one remains.
-            # uv_layers.remove() invalidates indices, so loop until empty.
-            while mesh.uv_layers:
-                mesh.uv_layers.remove(mesh.uv_layers[0])
-
-            uv_layer = mesh.uv_layers.new(name=uv_layer_name)
-            # Make it the active UV map AND the active-for-rendering UV map
-            mesh.uv_layers.active = uv_layer
-            uv_layer.active_render = True
-
-            for poly in mesh.polygons:
-                uniq_idx = slot_to_uniq.get(poly.material_index)
-                uv = uv_centers[uniq_idx] if uniq_idx is not None else (0.5, 0.5)
-                for loop_idx in poly.loop_indices:
-                    uv_layer.data[loop_idx].uv = uv
-
-        # ---- Build the new material ----
-        new_mat_name = f"{obj.name}_ColorGridMat"
-        new_mat = build_grid_material(new_mat_name, image)
-
-        # ---- Assign the new material ----
-        if self.replace_materials:
-            mesh.materials.clear()
-            mesh.materials.append(new_mat)
-            for poly in mesh.polygons:
-                poly.material_index = 0
-        else:
-            # Append as additional slot; do not reassign faces
-            mesh.materials.append(new_mat)
-
+        mode = "Updated" if old_count else "Created"
         self.report(
             {'INFO'},
-            f"Grid {cols}x{rows} ({len(unique_mats)} colors, "
-            f"{cols * rows - len(unique_mats)} empty) -> '{new_mat_name}'"
+            f"{mode} grid {new_cols}x{new_rows} ({len(manifest)} colors, "
+            f"+{len(manifest) - old_count} new) on {len(source_objs)} new / "
+            f"{len(existing_objs)} existing object(s)"
         )
+        return {'FINISHED'}
+
+
+class OBJECT_OT_restore_materials_from_grid(bpy.types.Operator):
+    """Rebuild per-color materials from the grid texture (reverse of baking)"""
+    bl_idname = "object.restore_materials_from_grid"
+    bl_label = "Restore Materials From Grid"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.type == 'MESH' for o in context.selected_objects)
+
+    def _build_material(self, entry):
+        """Get/create a material named entry['name'] with its base color set."""
+        name = entry["name"]
+        col = entry["color"]
+        rgba = (col[0], col[1], col[2], col[3] if len(col) > 3 else 1.0)
+
+        mat = bpy.data.materials.get(name)
+        if mat is None:
+            mat = bpy.data.materials.new(name=name)
+        mat.use_nodes = True
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf is None:
+            for n in mat.node_tree.nodes:
+                if n.type == 'BSDF_PRINCIPLED':
+                    bsdf = n
+                    break
+        if bsdf is not None:
+            bsdf.inputs["Base Color"].default_value = rgba
+        mat.diffuse_color = rgba
+        return mat
+
+    def execute(self, context):
+        sel = [o for o in context.selected_objects if o.type == 'MESH']
+        shared_mat = find_shared_material_from(sel)
+        if shared_mat is None:
+            self.report({'ERROR'}, "Selected objects don't use a grid material with a manifest")
+            return {'CANCELLED'}
+
+        manifest = read_manifest(shared_mat)
+        if not manifest:
+            self.report({'ERROR'}, "No manifest stored on the grid material")
+            return {'CANCELLED'}
+
+        cols, rows = calculate_grid(len(manifest))
+
+        mat_cache = {}   # cell index -> material (shared across objects)
+        processed = set()
+        count = 0
+
+        for obj in sel:
+            if not any(slot.material == shared_mat for slot in obj.material_slots):
+                continue
+            mesh = obj.data
+            if mesh.name in processed:
+                continue
+            processed.add(mesh.name)
+
+            uv_layer = mesh.uv_layers.get(UV_LAYER_NAME) or mesh.uv_layers.active
+            if uv_layer is None:
+                continue
+
+            # Determine which color cell each face maps to
+            face_cell = []
+            used_cells = set()
+            for poly in mesh.polygons:
+                u, v = uv_layer.data[poly.loop_indices[0]].uv
+                idx = min(uv_to_cell_index(u, v, cols, rows), len(manifest) - 1)
+                face_cell.append(idx)
+                used_cells.add(idx)
+
+            # Build this object's slot list from the cells it actually uses
+            used_sorted = sorted(used_cells)
+            cell_to_slot = {cell: i for i, cell in enumerate(used_sorted)}
+
+            mesh.materials.clear()
+            for cell in used_sorted:
+                if cell not in mat_cache:
+                    mat_cache[cell] = self._build_material(manifest[cell])
+                mesh.materials.append(mat_cache[cell])
+
+            for poly, cell in zip(mesh.polygons, face_cell):
+                poly.material_index = cell_to_slot[cell]
+
+            count += 1
+
+        self.report({'INFO'}, f"Restored materials on {count} object(s)")
         return {'FINISHED'}
 
 
@@ -298,16 +467,43 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
 # UI
 # ----------------------------------------------------------------------------
 
+class VIEW3D_PT_color_grid(bpy.types.Panel):
+    bl_label = "Color Grid"
+    bl_idname = "VIEW3D_PT_color_grid"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Color Grid"
+
+    def draw(self, context):
+        layout = self.layout
+
+        box = layout.box()
+        box.label(text="Bake / Update", icon='TEXTURE')
+        box.operator(
+            OBJECT_OT_material_color_grid.bl_idname,
+            text="Bake Selected to Grid",
+        )
+        box.label(text="Select objects, then bake.", icon='INFO')
+
+        box = layout.box()
+        box.label(text="Reverse", icon='MATERIAL')
+        box.operator(
+            OBJECT_OT_restore_materials_from_grid.bl_idname,
+            text="Restore Materials",
+        )
+        box.label(text="Rebuild per-color materials.", icon='INFO')
+
+
 def menu_func(self, context):
     self.layout.separator()
-    self.layout.operator(
-        OBJECT_OT_material_color_grid.bl_idname,
-        icon='TEXTURE',
-    )
+    self.layout.operator(OBJECT_OT_material_color_grid.bl_idname, icon='TEXTURE')
+    self.layout.operator(OBJECT_OT_restore_materials_from_grid.bl_idname, icon='MATERIAL')
 
 
 classes = (
     OBJECT_OT_material_color_grid,
+    OBJECT_OT_restore_materials_from_grid,
+    VIEW3D_PT_color_grid,
 )
 
 
