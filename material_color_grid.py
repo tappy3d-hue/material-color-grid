@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Material Color Grid Texture",
     "author": "Claude",
-    "version": (1, 5, 0),
+    "version": (1, 6, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > Color Grid tab",
     "description": "Pool base colors from selected objects into one shared grid "
@@ -601,6 +601,14 @@ class OBJECT_OT_export_grid_png(bpy.types.Operator):
     filepath: bpy.props.StringProperty(subtype='FILE_PATH')
     filename_ext = ".png"
 
+    reference_after_export: bpy.props.BoolProperty(
+        name="Reference Exported File (Unpack)",
+        description="After saving, point the image at the exported PNG and unpack it so it is no "
+                    "longer embedded in the .blend. This makes FBX export reference a real file on "
+                    "disk, which fixes textures not loading in Roblox Studio",
+        default=True,
+    )
+
     @classmethod
     def poll(cls, context):
         return any(o.type == 'MESH' for o in context.selected_objects)
@@ -629,6 +637,7 @@ class OBJECT_OT_export_grid_png(bpy.types.Operator):
         path = self.filepath
         if not path.lower().endswith(".png"):
             path += ".png"
+
         img.filepath_raw = path
         img.file_format = 'PNG'
         try:
@@ -636,7 +645,21 @@ class OBJECT_OT_export_grid_png(bpy.types.Operator):
         except RuntimeError as e:
             self.report({'ERROR'}, f"Save failed: {e}")
             return {'CANCELLED'}
-        self.report({'INFO'}, f"Saved texture to {path}")
+
+        if self.reference_after_export:
+            # Make the image an external file reference (the FBX exporter needs this).
+            img.filepath = path
+            img.source = 'FILE'
+            if img.packed_file is not None:
+                try:
+                    img.unpack(method='REMOVE')
+                except RuntimeError:
+                    pass
+            note = " (unpacked, now references the file)"
+        else:
+            note = ""
+
+        self.report({'INFO'}, f"Saved texture to {path}{note}")
         return {'FINISHED'}
 
 
