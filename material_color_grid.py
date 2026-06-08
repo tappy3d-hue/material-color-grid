@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Material Color Grid Texture",
     "author": "Claude",
-    "version": (1, 9, 0),
+    "version": (1, 11, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > Color Grid tab",
     "description": "Pool base colors (and optionally roughness/metallic) from selected "
@@ -17,6 +17,14 @@ import math
 import json
 import os
 import random
+import urllib.request
+import urllib.error
+import ssl
+
+# GitHub repo used for the in-Blender updater.
+UPDATE_REPO = "tappy3d-hue/material-color-grid"
+UPDATE_ASSET_NAME = "material_color_grid.py"
+UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 
 DEFAULT_GROUP_NAME = "ColorGrid"
 MANIFEST_KEY = "mcg_manifest"
@@ -268,6 +276,27 @@ def objects_using_material(mat):
             if obj.type == 'MESH' and any(m == mat for m in obj.data.materials)]
 
 
+def remove_unused_slots(context, obj):
+    """Remove material slots not used by any polygon (like Blender's built-in).
+    Returns the number of slots removed. Polygon material_index values are
+    remapped correctly by the operator."""
+    if not obj.material_slots:
+        return 0
+    before = len(obj.material_slots)
+    view_layer = context.view_layer
+    prev_active = view_layer.objects.active
+    view_layer.objects.active = obj
+    try:
+        if obj.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.material_slot_remove_unused()
+    except RuntimeError:
+        pass
+    finally:
+        view_layer.objects.active = prev_active
+    return before - len(obj.material_slots)
+
+
 def cells_for_map(manifest, key):
     """Build the list of (r,g,b,a) cells for a given map key."""
     if key == "color":
@@ -316,6 +345,7 @@ class MCGSettings(bpy.types.PropertyGroup):
     remap_uvs: bpy.props.BoolProperty(name="Remap UVs", default=True)
     replace_materials: bpy.props.BoolProperty(name="Replace Slots", default=True)
     sync_all_users: bpy.props.BoolProperty(name="Update All Users", default=True)
+    remove_unused_slots: bpy.props.BoolProperty(name="Remove Unused Slots", default=True)
 
 
 # ----------------------------------------------------------------------------
@@ -338,6 +368,12 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
     remap_uvs: bpy.props.BoolProperty(name="Remap UVs to Color Cells", default=True)
     replace_materials: bpy.props.BoolProperty(name="Replace Material Slots", default=True)
     sync_all_users: bpy.props.BoolProperty(name="Update All Objects Using Texture", default=True)
+    remove_unused_slots: bpy.props.BoolProperty(
+        name="Remove Unused Slots Before Bake",
+        description="Delete material slots not used by any face on the object before baking "
+                    "(same as Blender's Remove Unused Slots), so unused colors don't take grid cells",
+        default=True,
+    )
 
     @classmethod
     def poll(cls, context):
@@ -348,6 +384,11 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
         if not sel:
             self.report({'ERROR'}, "No mesh objects selected")
             return {'CANCELLED'}
+
+        # Remove material slots not used by any face, before collecting colors.
+        if self.remove_unused_slots:
+            for obj in sel:
+                remove_unused_slots(context, obj)
 
         shared_mat = find_shared_material_from(sel)
         manifest = read_manifest(shared_mat) if shared_mat else []
@@ -853,6 +894,7 @@ class VIEW3D_PT_color_grid(bpy.types.Panel):
         col.prop(s, "remap_uvs")
         col.prop(s, "replace_materials")
         col.prop(s, "sync_all_users")
+        col.prop(s, "remove_unused_slots")
         op = box.operator(OBJECT_OT_material_color_grid.bl_idname, text="Bake Selected to Grid")
         op.group_name = s.grid_name
         op.resolution = s.resolution
@@ -864,6 +906,7 @@ class VIEW3D_PT_color_grid(bpy.types.Panel):
         op.remap_uvs = s.remap_uvs
         op.replace_materials = s.replace_materials
         op.sync_all_users = s.sync_all_users
+        op.remove_unused_slots = s.remove_unused_slots
 
         box = layout.box()
         box.label(text="Tools", icon='TOOL_SETTINGS')
@@ -884,8 +927,194 @@ def menu_func(self, context):
     self.layout.operator(OBJECT_OT_restore_materials_from_grid.bl_idname, icon='MATERIAL')
 
 
+# ----------------------------------------------------------------------------
+# Updater
+# ----------------------------------------------------------------------------
+
+def _current_version():
+    return bl_info["version"]
+
+
+def _parse_version(tag):
+    """'v1.10.0' or '1.10.0' -> (1, 10, 0). Returns None if unparseable."""
+    if not tag:
+        return None
+    s = tag.strip().lstrip("vV")
+    parts = s.split(".")
+    nums = []
+    for p in parts:
+        digits = "".join(ch for ch in p if ch.isdigit())
+        if digits == "":
+            break
+        nums.append(int(digits))
+    return tuple(nums) if nums else None
+
+
+def _http_get(url, want_json=False, timeout=15):
+    ctx = ssl.create_default_context()
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "material-color-grid-updater",
+        "Accept": "application/vnd.github+json" if want_json else "*/*",
+    })
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        data = resp.read()
+    return json.loads(data.decode("utf-8")) if want_json else data
+
+
+def _fetch_latest_release():
+    """Return dict {version, tag, asset_url, html_url} for the latest release, or raises."""
+    info = _http_get(UPDATE_API_URL, want_json=True)
+    tag = info.get("tag_name", "")
+    html_url = info.get("html_url", "")
+    asset_url = None
+    for asset in info.get("assets", []):
+        if asset.get("name") == UPDATE_ASSET_NAME:
+            asset_url = asset.get("browser_download_url")
+            break
+    return {
+        "version": _parse_version(tag),
+        "tag": tag,
+        "asset_url": asset_url,
+        "html_url": html_url,
+    }
+
+
+def _addon_file_path():
+    """Absolute path to THIS addon's .py file on disk."""
+    return os.path.abspath(__file__)
+
+
+class MCG_OT_check_update(bpy.types.Operator):
+    """Check GitHub for a newer release"""
+    bl_idname = "mcg.check_update"
+    bl_label = "Check for Updates"
+
+    def execute(self, context):
+        prefs = context.preferences.addons[__name__].preferences
+        try:
+            rel = _fetch_latest_release()
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError, TimeoutError) as e:
+            prefs.update_status = f"Check failed: {e}"
+            prefs.update_available = False
+            self.report({'ERROR'}, f"Update check failed: {e}")
+            return {'CANCELLED'}
+
+        latest = rel["version"]
+        prefs.latest_tag = rel["tag"] or ""
+        prefs.latest_asset_url = rel["asset_url"] or ""
+        prefs.latest_html_url = rel["html_url"] or ""
+
+        cur = _current_version()
+        if latest is None:
+            prefs.update_status = f"Could not parse latest version ('{rel['tag']}')"
+            prefs.update_available = False
+        elif latest > cur:
+            prefs.update_available = True
+            prefs.update_status = (
+                f"Update available: {rel['tag']} "
+                f"(installed v{cur[0]}.{cur[1]}.{cur[2]})"
+            )
+        else:
+            prefs.update_available = False
+            prefs.update_status = f"Up to date (v{cur[0]}.{cur[1]}.{cur[2]})"
+        return {'FINISHED'}
+
+
+class MCG_OT_install_update(bpy.types.Operator):
+    """Download the latest release and overwrite this addon's file (restart to apply)"""
+    bl_idname = "mcg.install_update"
+    bl_label = "Download & Install Update"
+
+    def execute(self, context):
+        prefs = context.preferences.addons[__name__].preferences
+        url = prefs.latest_asset_url
+        if not url:
+            self.report({'ERROR'}, "No download URL. Run Check for Updates first.")
+            return {'CANCELLED'}
+
+        try:
+            data = _http_get(url, want_json=False)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+            prefs.update_status = f"Download failed: {e}"
+            self.report({'ERROR'}, f"Download failed: {e}")
+            return {'CANCELLED'}
+
+        # Basic sanity: it should look like our addon source.
+        text = data.decode("utf-8", errors="replace")
+        if "Material Color Grid Texture" not in text or "bl_info" not in text:
+            prefs.update_status = "Downloaded file doesn't look valid; aborted."
+            self.report({'ERROR'}, "Downloaded file failed validation; not installed.")
+            return {'CANCELLED'}
+
+        path = _addon_file_path()
+        try:
+            # Back up the current file, then overwrite.
+            backup = path + ".bak"
+            try:
+                if os.path.exists(path):
+                    with open(path, "rb") as src, open(backup, "wb") as dst:
+                        dst.write(src.read())
+            except OSError:
+                pass
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+        except OSError as e:
+            prefs.update_status = f"Write failed: {e}"
+            self.report({'ERROR'}, f"Could not write addon file: {e}")
+            return {'CANCELLED'}
+
+        prefs.update_available = False
+        prefs.update_status = f"Installed {prefs.latest_tag}. Restart Blender to apply."
+        self.report({'INFO'}, "Update installed. Please restart Blender to apply.")
+        return {'FINISHED'}
+
+
+class MCG_OT_open_releases(bpy.types.Operator):
+    """Open the GitHub releases page in a browser"""
+    bl_idname = "mcg.open_releases"
+    bl_label = "Open Releases Page"
+
+    def execute(self, context):
+        prefs = context.preferences.addons[__name__].preferences
+        url = prefs.latest_html_url or f"https://github.com/{UPDATE_REPO}/releases"
+        bpy.ops.wm.url_open(url=url)
+        return {'FINISHED'}
+
+
+class MCGAddonPreferences(bpy.types.AddonPreferences):
+    bl_idname = __name__
+
+    update_status: bpy.props.StringProperty(default="")
+    update_available: bpy.props.BoolProperty(default=False)
+    latest_tag: bpy.props.StringProperty(default="")
+    latest_asset_url: bpy.props.StringProperty(default="")
+    latest_html_url: bpy.props.StringProperty(default="")
+
+    def draw(self, context):
+        layout = self.layout
+        v = _current_version()
+        col = layout.column()
+        col.label(text=f"Installed version: v{v[0]}.{v[1]}.{v[2]}")
+
+        row = col.row(align=True)
+        row.operator(MCG_OT_check_update.bl_idname, icon='FILE_REFRESH')
+        row.operator(MCG_OT_open_releases.bl_idname, icon='URL')
+
+        if self.update_status:
+            icon = 'ERROR' if self.update_available else 'INFO'
+            col.label(text=self.update_status, icon=icon)
+
+        if self.update_available:
+            col.operator(MCG_OT_install_update.bl_idname, icon='IMPORT')
+            col.label(text="After installing, restart Blender to apply.", icon='INFO')
+
+
 classes = (
     MCGSettings,
+    MCGAddonPreferences,
+    MCG_OT_check_update,
+    MCG_OT_install_update,
+    MCG_OT_open_releases,
     OBJECT_OT_material_color_grid,
     OBJECT_OT_restore_materials_from_grid,
     OBJECT_OT_rename_grid,
