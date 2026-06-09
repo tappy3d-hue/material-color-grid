@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Material Color Grid Texture",
     "author": "Claude",
-    "version": (1, 11, 0),
+    "version": (1, 18, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > Color Grid tab",
     "description": "Pool base colors (and optionally roughness/metallic) from selected "
@@ -21,6 +21,11 @@ import urllib.request
 import urllib.error
 import ssl
 
+try:
+    import numpy as _np
+except ImportError:
+    _np = None
+
 # GitHub repo used for the in-Blender updater.
 UPDATE_REPO = "tappy3d-hue/material-color-grid"
 UPDATE_ASSET_NAME = "material_color_grid.py"
@@ -29,6 +34,15 @@ UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 DEFAULT_GROUP_NAME = "ColorGrid"
 MANIFEST_KEY = "mcg_manifest"
 UV_LAYER_NAME = "ColorGridUV"
+
+# Per-object processing modes
+MODE_ITEMS = [
+    ('ATLAS', "Atlas", "Bake this object's material colors into the shared grid texture"),
+    ('VERTEX', "Vertex Color", "Bake base colors into vertex colors (implemented later)"),
+    ('JSON', "JSON", "Export colors as data for dynamic coloring in Roblox (implemented later)"),
+    ('NONE', "None", "Leave this object untouched"),
+]
+VALID_MODES = {m[0] for m in MODE_ITEMS}
 
 # Roughness/Metallic are quantized to this step (0.1) by rounding (four-go-go-nyu).
 QUANT_STEP = 0.1
@@ -46,6 +60,32 @@ def make_seed(length=6):
     return "".join(random.choice("0123456789abcdef") for _ in range(length))
 
 
+JSON_ID_KEY = "mcg_export_id"   # per-object: stable short id embedded in export name
+
+
+def sanitize_name(name, max_len=40):
+    """Make a Roblox-safe, short, plain name: keep word chars, trim length."""
+    out = []
+    for ch in name:
+        out.append(ch if (ch.isalnum() or ch in "_") else "_")
+    s = "".join(out).strip("_") or "Obj"
+    return s[:max_len]
+
+
+def get_export_id(obj):
+    """Return a stable short id for this object, creating one if needed."""
+    val = obj.get(JSON_ID_KEY)
+    if not val:
+        val = make_seed()
+        obj[JSON_ID_KEY] = val
+    return val
+
+
+def export_key_for(obj):
+    """Stable, unique, Roblox-safe key: <sanitized name>_<id>."""
+    return f"{sanitize_name(obj.name)}_{get_export_id(obj)}"
+
+
 # ----------------------------------------------------------------------------
 # Color / value helpers
 # ----------------------------------------------------------------------------
@@ -56,6 +96,16 @@ def linear_to_srgb_channel(c):
     if c <= 0.0031308:
         return 12.92 * c
     return 1.055 * (c ** (1.0 / 2.4)) - 0.055
+
+
+def color_to_rgb255(linear_rgba):
+    """Linear RGBA tuple -> [r,g,b] 0-255 sRGB ints (for Roblox Color3.fromRGB)."""
+    r, g, b = linear_rgba[0], linear_rgba[1], linear_rgba[2]
+    return [
+        max(0, min(255, int(round(linear_to_srgb_channel(r) * 255)))),
+        max(0, min(255, int(round(linear_to_srgb_channel(g) * 255)))),
+        max(0, min(255, int(round(linear_to_srgb_channel(b) * 255)))),
+    ]
 
 
 def quantize(v):
@@ -251,6 +301,61 @@ def find_shared_material_from(objs):
     return None
 
 
+def material_has_image_basecolor(mat):
+    """True if the material's Base Color is driven by an image texture node."""
+    if not (mat.use_nodes and mat.node_tree):
+        return False
+    bsdf = _principled(mat)
+    if bsdf is None:
+        return False
+    bc = bsdf.inputs.get("Base Color")
+    if bc is None or not bc.links:
+        return False
+    node = bc.links[0].from_node
+    return node.type == 'TEX_IMAGE'
+
+
+def auto_detect_mode(obj):
+    """Pick a sensible default mode for an object."""
+    if not obj.material_slots or all(s.material is None for s in obj.material_slots):
+        return 'NONE'
+    # Already a baked grid object -> leave it alone
+    if any(s.material is not None and MANIFEST_KEY in s.material for s in obj.material_slots):
+        return 'NONE'
+    # Otherwise default to atlas (covers both image-textured and solid materials)
+    return 'ATLAS'
+
+
+def _mode_to_index(ident):
+    for i, (k, _n, _d) in enumerate(MODE_ITEMS):
+        if k == ident:
+            return i
+    return 0
+
+
+# EnumProperty get/set for Object.mcg_mode. get() must never write data (it can
+# run during UI draw), so unset objects fall back to auto-detection read-only.
+def _mode_get(self):
+    raw = self.get("mcg_mode_raw", -1)
+    if not isinstance(raw, int) or raw < 0 or raw >= len(MODE_ITEMS):
+        return _mode_to_index(auto_detect_mode(self))
+    return raw
+
+
+def _mode_set(self, value):
+    self["mcg_mode_raw"] = int(value)
+
+
+def get_object_mode(obj):
+    """Read the object's mode (auto-detected if never set). Does not write."""
+    return obj.mcg_mode
+
+
+def set_object_mode(obj, mode):
+    if mode in VALID_MODES:
+        obj.mcg_mode = mode
+
+
 def read_manifest(mat):
     raw = mat.get(MANIFEST_KEY)
     if not raw:
@@ -264,6 +369,7 @@ def read_manifest(mat):
         e.setdefault("roughness", 0.5)
         e.setdefault("metallic", 0.0)
         e.setdefault("color", [0.8, 0.8, 0.8, 1.0])
+        e.setdefault("image", "")
     return data
 
 
@@ -308,6 +414,133 @@ def cells_for_map(manifest, key):
     return [], True
 
 
+def get_basecolor_image(mat):
+    """Return the image plugged directly into Base Color, or None."""
+    bsdf = _principled(mat)
+    if bsdf is None:
+        return None
+    bc = bsdf.inputs.get("Base Color")
+    if bc is None or not bc.links:
+        return None
+    node = bc.links[0].from_node
+    if node.type == 'TEX_IMAGE' and node.image is not None:
+        return node.image
+    return None
+
+
+def _cell_rect_px(idx, cols, rows, W, H):
+    col = idx % cols
+    row = idx // cols
+    rfb = rows - 1 - row
+    x0 = (col * W) // cols
+    x1 = ((col + 1) * W) // cols
+    y0 = (rfb * H) // rows
+    y1 = ((rfb + 1) * H) // rows
+    return x0, x1, y0, y1
+
+
+def composite_atlas(img, fills):
+    """Paint the atlas using numpy. fills[idx] is ('img', image) or ('rgba', (r,g,b,a)).
+    Image pixels are copied (nearest-neighbor scaled) directly; solid fills are written
+    as given (already sRGB-encoded for color, raw for data)."""
+    if _np is None:
+        # Fallback: solid only (image cells become their rgba fallback if provided)
+        cells = []
+        for f in fills:
+            cells.append(f[1] if f[0] == 'rgba' else (1.0, 1.0, 1.0, 1.0))
+        paint_grid(img, cells, srgb=False)
+        return
+
+    W, H = img.size
+    n = len(fills)
+    cols, rows = calculate_grid(n)
+    arr = _np.zeros((H, W, 4), dtype=_np.float32)
+
+    for idx, fill in enumerate(fills):
+        x0, x1, y0, y1 = _cell_rect_px(idx, cols, rows, W, H)
+        tw, th = x1 - x0, y1 - y0
+        if tw <= 0 or th <= 0:
+            continue
+        if fill[0] == 'img' and fill[1] is not None and fill[1].size[0] > 0 and fill[1].size[1] > 0:
+            src = fill[1]
+            sw, sh = src.size
+            buf = _np.empty(sw * sh * 4, dtype=_np.float32)
+            src.pixels.foreach_get(buf)
+            buf = buf.reshape(sh, sw, 4)
+            xi = _np.linspace(0, sw - 1, tw).astype(_np.int64)
+            yi = _np.linspace(0, sh - 1, th).astype(_np.int64)
+            arr[y0:y1, x0:x1, :] = buf[yi][:, xi, :]
+        else:
+            rgba = fill[1] if fill[0] == 'rgba' else (1.0, 1.0, 1.0, 1.0)
+            arr[y0:y1, x0:x1, :] = rgba
+
+    img.pixels.foreach_set(arr.reshape(-1))
+    img.update()
+    img.pack()
+
+
+def export_image_to(img, path):
+    """Write an image to a PNG path and switch it to reference that file (unpack)."""
+    img.filepath_raw = path
+    img.file_format = 'PNG'
+    img.save()
+    img.filepath = path
+    img.source = 'FILE'
+    if img.packed_file is not None:
+        try:
+            img.unpack(method='REMOVE')
+        except RuntimeError:
+            pass
+
+
+def paint_color_map(img, manifest, padding_px=0):
+    """Color atlas: image cells copy their texture, others fill solid sRGB color."""
+    fills = []
+    for e in manifest:
+        src = bpy.data.images.get(e.get("image", "")) if e.get("image") else None
+        if src is not None:
+            fills.append(('img', src))
+        else:
+            c = e["color"]
+            fills.append(('rgba', (
+                linear_to_srgb_channel(c[0]),
+                linear_to_srgb_channel(c[1]),
+                linear_to_srgb_channel(c[2]),
+                c[3] if len(c) > 3 else 1.0,
+            )))
+    composite_atlas(img, fills)
+
+
+def paint_data_map(img, manifest, key):
+    """Roughness/metallic atlas: solid quantized grayscale per cell."""
+    fills = []
+    for e in manifest:
+        v = quantize(e.get(key, 0.0))
+        fills.append(('rgba', (v, v, v, 1.0)))
+    composite_atlas(img, fills)
+
+
+def cell_uv_rect(idx, cols, rows):
+    """UV-space (u0, v0, w, h) of a cell."""
+    col = idx % cols
+    row = idx // cols
+    u0 = col / cols
+    v0 = (rows - 1 - row) / rows
+    return u0, v0, 1.0 / cols, 1.0 / rows
+
+
+def image_cell_uv(idx, cols, rows, ou, ov, W, H, padding_px):
+    """Map an original UV (0-1) into cell idx's inner rect (with px padding inset)."""
+    u0, v0, cw, ch = cell_uv_rect(idx, cols, rows)
+    iu = (padding_px / W) if W else 0.0
+    iv = (padding_px / H) if H else 0.0
+    inner_w = max(cw - 2 * iu, 1e-6)
+    inner_h = max(ch - 2 * iv, 1e-6)
+    fu = ou - math.floor(ou)
+    fv = ov - math.floor(ov)
+    return (u0 + iu + fu * inner_w, v0 + iv + fv * inner_h)
+
+
 # ----------------------------------------------------------------------------
 # Panel settings
 # ----------------------------------------------------------------------------
@@ -331,6 +564,11 @@ class MCGSettings(bpy.types.PropertyGroup):
         name="Cell Pixels", description="Pixels per cell when Minimal Resolution is on",
         default=8, min=1, max=256,
     )
+    cell_padding: bpy.props.IntProperty(
+        name="Cell Padding",
+        description="Inset (pixels) for textured cells to prevent edge bleeding",
+        default=2, min=0, max=64,
+    )
     bake_roughness: bpy.props.BoolProperty(
         name="Roughness Map",
         description="Also bake a grayscale roughness texture (values rounded to 0.1)",
@@ -346,6 +584,21 @@ class MCGSettings(bpy.types.PropertyGroup):
     replace_materials: bpy.props.BoolProperty(name="Replace Slots", default=True)
     sync_all_users: bpy.props.BoolProperty(name="Update All Users", default=True)
     remove_unused_slots: bpy.props.BoolProperty(name="Remove Unused Slots", default=True)
+    auto_export_after_bake: bpy.props.BoolProperty(
+        name="Auto Export + Unpack After Bake",
+        description="After baking, save the atlas as PNG next to the .blend and reference it "
+                    "(unpack), so FBX export embeds the texture without manual steps",
+        default=False,
+    )
+    tri_warn_threshold: bpy.props.IntProperty(
+        name="Max Triangles", description="Warn if a mesh exceeds this triangle count",
+        default=20000, min=100, max=2000000,
+    )
+    tex_warn_resolution: bpy.props.IntProperty(
+        name="Max Texture", description="Warn if a texture is larger than this (px)",
+        default=1024, min=16, max=8192,
+    )
+    check_report: bpy.props.StringProperty(default="", options={'HIDDEN'})
 
 
 # ----------------------------------------------------------------------------
@@ -362,6 +615,11 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
     group_name: bpy.props.StringProperty(name="Group Name", default=DEFAULT_GROUP_NAME)
     minimal_resolution: bpy.props.BoolProperty(name="Minimal Resolution", default=False)
     cell_pixels: bpy.props.IntProperty(name="Cell Pixels", default=8, min=1, max=256)
+    cell_padding: bpy.props.IntProperty(
+        name="Cell Padding",
+        description="Inset (pixels) for textured cells to prevent edge bleeding in Roblox",
+        default=2, min=0, max=64,
+    )
     bake_roughness: bpy.props.BoolProperty(name="Roughness Map", default=True)
     bake_metallic: bpy.props.BoolProperty(name="Metallic Map", default=True)
     create_vertex_groups: bpy.props.BoolProperty(name="Create Vertex Groups", default=True)
@@ -374,15 +632,33 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
                     "(same as Blender's Remove Unused Slots), so unused colors don't take grid cells",
         default=True,
     )
+    auto_export: bpy.props.BoolProperty(
+        name="Auto Export + Unpack After Bake",
+        description="Save the atlas PNG next to the .blend and reference it after baking",
+        default=False,
+    )
 
     @classmethod
     def poll(cls, context):
         return any(o.type == 'MESH' for o in context.selected_objects)
 
     def execute(self, context):
-        sel = [o for o in context.selected_objects if o.type == 'MESH']
-        if not sel:
+        all_sel = [o for o in context.selected_objects if o.type == 'MESH']
+        if not all_sel:
             self.report({'ERROR'}, "No mesh objects selected")
+            return {'CANCELLED'}
+
+        # Split selection by per-object mode. Only ATLAS objects are baked here;
+        # VERTEX / JSON are handled by their own operators (implemented later).
+        sel = [o for o in all_sel if get_object_mode(o) == 'ATLAS']
+        other_modes = sorted({get_object_mode(o) for o in all_sel
+                              if get_object_mode(o) not in ('ATLAS', 'NONE')})
+
+        if not sel:
+            msg = "No objects set to Atlas mode."
+            if other_modes:
+                msg += " (Vertex Color / JSON export will come in a later step.)"
+            self.report({'WARNING'}, msg)
             return {'CANCELLED'}
 
         # Remove material slots not used by any face, before collecting colors.
@@ -408,11 +684,13 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
                 mat = slot.material
                 if mat is None or mat == shared_mat:
                     continue
+                src_img = get_basecolor_image(mat)
                 entry = {
                     "name": mat.name,
                     "color": list(get_base_color(mat)),
                     "roughness": get_principled_value(mat, "Roughness", 0.5),
                     "metallic": get_principled_value(mat, "Metallic", 0.0),
+                    "image": src_img.name if src_img is not None else "",
                 }
                 if mat.name in name_to_index:
                     manifest[name_to_index[mat.name]] = entry
@@ -463,14 +741,17 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
                 img.scale(tw, th)
             # ensure correct colorspace
             img.colorspace_settings.name = 'Non-Color' if is_data else 'sRGB'
-            cells, srgb = cells_for_map(manifest, key)
-            paint_grid(img, cells, srgb)
+            if key == "color":
+                paint_color_map(img, manifest, self.cell_padding)
+            else:
+                paint_data_map(img, manifest, key)
             images[key] = img
 
         setup_grid_material(shared_mat, images)
         write_manifest(shared_mat, manifest)
 
-        # Remap existing textured objects (UV layout change)
+        # Remap existing textured objects (UV layout change). Preserve each loop's
+        # relative position within its cell so image cells aren't collapsed.
         if old_count and (new_cols, new_rows) != (old_cols, old_rows):
             targets = (objects_using_material(shared_mat)
                        if self.sync_all_users else existing_objs)
@@ -484,10 +765,15 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
                 if uv is None:
                     continue
                 for poly in mesh.polygons:
-                    u, v = uv.data[poly.loop_indices[0]].uv
-                    idx = min(uv_to_cell_index(u, v, old_cols, old_rows), len(uv_centers) - 1)
                     for li in poly.loop_indices:
-                        uv.data[li].uv = uv_centers[idx]
+                        u, v = uv.data[li].uv
+                        idx = uv_to_cell_index(u, v, old_cols, old_rows)
+                        idx = min(idx, len(manifest) - 1)
+                        ou0, ov0, ow, oh = cell_uv_rect(idx, old_cols, old_rows)
+                        lu = min(max((u - ou0) / ow, 0.0), 1.0) if ow else 0.5
+                        lv = min(max((v - ov0) / oh, 0.0), 1.0) if oh else 0.5
+                        nu0, nv0, nw, nh = cell_uv_rect(idx, new_cols, new_rows)
+                        uv.data[li].uv = (nu0 + lu * nw, nv0 + lv * nh)
 
         # Apply to source objects
         processed = set()
@@ -517,6 +803,11 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
             processed.add(mesh.name)
 
             if self.remap_uvs:
+                # Capture original UVs before clearing (needed for image cells).
+                src_layer = mesh.uv_layers.active
+                orig = None
+                if src_layer is not None:
+                    orig = [tuple(src_layer.data[i].uv) for i in range(len(mesh.loops))]
                 while mesh.uv_layers:
                     mesh.uv_layers.remove(mesh.uv_layers[0])
                 uvl = mesh.uv_layers.new(name=UV_LAYER_NAME)
@@ -524,9 +815,19 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
                 uvl.active_render = True
                 for poly in mesh.polygons:
                     idx = slot_to_idx.get(poly.material_index)
-                    uv = uv_centers[idx] if idx is not None else (0.5, 0.5)
-                    for li in poly.loop_indices:
-                        uvl.data[li].uv = uv
+                    if idx is None:
+                        for li in poly.loop_indices:
+                            uvl.data[li].uv = (0.5, 0.5)
+                        continue
+                    if manifest[idx].get("image"):
+                        for li in poly.loop_indices:
+                            ou, ov = orig[li] if orig else (0.0, 0.0)
+                            uvl.data[li].uv = image_cell_uv(
+                                idx, new_cols, new_rows, ou, ov, tw, th, self.cell_padding)
+                    else:
+                        c = uv_centers[idx]
+                        for li in poly.loop_indices:
+                            uvl.data[li].uv = c
 
             if self.replace_materials:
                 mesh.materials.clear()
@@ -536,11 +837,31 @@ class OBJECT_OT_material_color_grid(bpy.types.Operator):
             elif shared_mat.name not in [m.name for m in mesh.materials if m]:
                 mesh.materials.append(shared_mat)
 
+        # Optional: auto-export atlas PNGs next to the .blend and reference them.
+        exported_note = ""
+        if self.auto_export:
+            blend_dir = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else ""
+            if not blend_dir:
+                self.report({'WARNING'}, "Save the .blend first to auto-export textures")
+            else:
+                n = 0
+                for key in ("color", "roughness", "metallic"):
+                    img = images.get(key)
+                    if img is None:
+                        continue
+                    try:
+                        export_image_to(img, os.path.join(blend_dir, img.name + ".png"))
+                        n += 1
+                    except (RuntimeError, OSError):
+                        pass
+                exported_note = f"; exported {n} PNG(s)"
+
         mode = "Updated" if old_count else "Created"
         maps = "+".join(k for k in ("color", "roughness", "metallic") if k in images)
+        extra = f"; skipped modes: {', '.join(other_modes)}" if other_modes else ""
         self.report({'INFO'},
                     f"{mode} grid {new_cols}x{new_rows} ({len(manifest)} cells, "
-                    f"+{len(manifest) - old_count} new) maps: {maps}")
+                    f"+{len(manifest) - old_count} new) maps: {maps}{extra}{exported_note}")
         return {'FINISHED'}
 
 
@@ -771,18 +1092,25 @@ class OBJECT_OT_compact_grid(bpy.types.Operator):
             old_to_new[old_idx] = len(new_manifest)
             new_manifest.append(manifest[old_idx])
 
-        uv_centers, _, _ = compute_uv_centers(len(new_manifest))
+        new_cols, new_rows = calculate_grid(len(new_manifest))
         for key, img in imgs.items():
-            is_data = key != "color"
-            cells, srgb = cells_for_map(new_manifest, key)
-            paint_grid(img, cells, srgb)
+            if key == "color":
+                paint_color_map(img, new_manifest, context.scene.mcg_settings.cell_padding)
+            else:
+                paint_data_map(img, new_manifest, key)
         write_manifest(mat, new_manifest)
 
+        # Remap UVs, preserving each loop's relative position within its cell.
         for uv, faces in per_mesh.values():
             for poly, old_idx in faces:
-                new_uv = uv_centers[old_to_new[old_idx]]
+                new_idx = old_to_new[old_idx]
+                ou0, ov0, ow, oh = cell_uv_rect(old_idx, old_cols, old_rows)
+                nu0, nv0, nw, nh = cell_uv_rect(new_idx, new_cols, new_rows)
                 for li in poly.loop_indices:
-                    uv.data[li].uv = new_uv
+                    u, v = uv.data[li].uv
+                    lu = min(max((u - ou0) / ow, 0.0), 1.0) if ow else 0.5
+                    lv = min(max((v - ov0) / oh, 0.0), 1.0) if oh else 0.5
+                    uv.data[li].uv = (nu0 + lu * nw, nv0 + lv * nh)
 
         self.report({'INFO'}, f"Removed {removed} unused cell(s); {len(new_manifest)} remain")
         return {'FINISHED'}
@@ -870,6 +1198,488 @@ class OBJECT_OT_export_grid_png(bpy.types.Operator):
 # UI
 # ----------------------------------------------------------------------------
 
+class OBJECT_OT_set_grid_mode(bpy.types.Operator):
+    """Set the processing mode (for one object, or all selected meshes)"""
+    bl_idname = "object.set_grid_mode"
+    bl_label = "Set Mode"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: bpy.props.EnumProperty(items=MODE_ITEMS, name="Mode")
+    object_name: bpy.props.StringProperty(
+        name="Object", default="",
+        description="If set, only this object; otherwise all selected meshes")
+
+    def execute(self, context):
+        if self.object_name:
+            obj = bpy.data.objects.get(self.object_name)
+            targets = [obj] if (obj is not None and obj.type == 'MESH') else []
+        else:
+            targets = [o for o in context.selected_objects if o.type == 'MESH']
+        if not targets:
+            self.report({'WARNING'}, "No mesh objects to set")
+            return {'CANCELLED'}
+        for obj in targets:
+            set_object_mode(obj, self.mode)
+        return {'FINISHED'}
+
+
+def bake_vertex_colors(obj):
+    """Write each face's material Base Color into a vertex color (Color Attribute).
+    Colors are stored sRGB-encoded so they look right after FBX/glTF export.
+    Returns True on success."""
+    mesh = obj.data
+    if not mesh.polygons:
+        return False
+
+    # Per-slot sRGB color (RGBA 0-1), falling back to white where missing.
+    slot_colors = []
+    for slot in obj.material_slots:
+        mat = slot.material
+        if mat is None:
+            slot_colors.append((1.0, 1.0, 1.0, 1.0))
+        else:
+            lin = get_base_color(mat)
+            slot_colors.append((
+                linear_to_srgb_channel(lin[0]),
+                linear_to_srgb_channel(lin[1]),
+                linear_to_srgb_channel(lin[2]),
+                1.0,
+            ))
+    if not slot_colors:
+        slot_colors = [(1.0, 1.0, 1.0, 1.0)]
+
+    # Create/replace a per-corner (face-corner) color attribute named "Col".
+    attr_name = "Col"
+    ca = mesh.color_attributes
+    existing = ca.get(attr_name)
+    if existing is not None:
+        try:
+            ca.remove(existing)
+        except RuntimeError:
+            pass
+    layer = ca.new(name=attr_name, type='BYTE_COLOR', domain='CORNER')
+    ca.active_color = layer
+    ca.render_color_index = list(ca).index(layer) if layer in list(ca) else 0
+
+    for poly in mesh.polygons:
+        idx = poly.material_index
+        col = slot_colors[idx] if 0 <= idx < len(slot_colors) else (1.0, 1.0, 1.0, 1.0)
+        for li in poly.loop_indices:
+            layer.data[li].color = col
+    mesh.update()
+    return True
+
+
+class OBJECT_OT_bake_vertex_colors(bpy.types.Operator):
+    """Bake Base Color into vertex colors for VERTEX-mode objects"""
+    bl_idname = "object.bake_vertex_colors"
+    bl_label = "Bake Vertex Colors"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.type == 'MESH' for o in context.selected_objects)
+
+    def execute(self, context):
+        targets = [o for o in context.selected_objects
+                   if o.type == 'MESH' and get_object_mode(o) == 'VERTEX']
+        if not targets:
+            self.report({'WARNING'}, "No objects set to Vertex Color mode")
+            return {'CANCELLED'}
+
+        done = 0
+        for obj in targets:
+            if bake_vertex_colors(obj):
+                done += 1
+        self.report({'INFO'}, f"Baked vertex colors on {done} object(s). "
+                              f"Export FBX/glTF to keep them.")
+        return {'FINISHED'}
+
+
+def material_matches(mat, rgba, rough, metal, tol=1e-4):
+    bsdf = _principled(mat)
+    if bsdf is None:
+        return False
+    bc = bsdf.inputs.get("Base Color")
+    if bc is None:
+        return False
+    v = bc.default_value
+    if any(abs(v[i] - rgba[i]) > tol for i in range(3)):
+        return False
+    ri = bsdf.inputs.get("Roughness")
+    if ri is not None and abs(float(ri.default_value) - rough) > tol:
+        return False
+    mi = bsdf.inputs.get("Metallic")
+    if mi is not None and abs(float(mi.default_value) - metal) > tol:
+        return False
+    return True
+
+
+def build_or_reuse_material(entry):
+    """Get/create a material for a manifest entry without overwriting a different same-name one."""
+    name = entry["name"]
+    col = entry["color"]
+    rgba = (col[0], col[1], col[2], col[3] if len(col) > 3 else 1.0)
+    rough = float(entry.get("roughness", 0.5))
+    metal = float(entry.get("metallic", 0.0))
+
+    existing = bpy.data.materials.get(name)
+    if existing is not None and material_matches(existing, rgba, rough, metal):
+        return existing
+
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    bsdf = _principled(mat)
+    if bsdf is not None:
+        bsdf.inputs["Base Color"].default_value = rgba
+        if bsdf.inputs.get("Roughness") is not None:
+            bsdf.inputs["Roughness"].default_value = rough
+        if bsdf.inputs.get("Metallic") is not None:
+            bsdf.inputs["Metallic"].default_value = metal
+    mat.diffuse_color = rgba
+    return mat
+
+
+def restore_object_materials(obj):
+    """Rebuild per-face individual materials on a grid-baked object from its manifest."""
+    shared_mat = None
+    for slot in obj.material_slots:
+        if slot.material is not None and MANIFEST_KEY in slot.material:
+            shared_mat = slot.material
+            break
+    if shared_mat is None:
+        return False
+    manifest = read_manifest(shared_mat)
+    if not manifest:
+        return False
+
+    mesh = obj.data
+    cols, rows = calculate_grid(len(manifest))
+    uv = mesh.uv_layers.get(UV_LAYER_NAME) or mesh.uv_layers.active
+    if uv is None:
+        return False
+
+    face_cell, used = [], set()
+    for poly in mesh.polygons:
+        u, v = uv.data[poly.loop_indices[0]].uv
+        idx = min(uv_to_cell_index(u, v, cols, rows), len(manifest) - 1)
+        face_cell.append(idx)
+        used.add(idx)
+
+    used_sorted = sorted(used)
+    cell_to_slot = {c: i for i, c in enumerate(used_sorted)}
+    mesh.materials.clear()
+    cache = {}
+    for c in used_sorted:
+        cache[c] = build_or_reuse_material(manifest[c])
+        mesh.materials.append(cache[c])
+    for poly, c in zip(mesh.polygons, face_cell):
+        poly.material_index = cell_to_slot[c]
+    return True
+
+
+def used_material_count(obj):
+    """Number of distinct materials actually used by the object's faces."""
+    names = set()
+    for poly in obj.data.polygons:
+        if 0 <= poly.material_index < len(obj.material_slots):
+            mat = obj.material_slots[poly.material_index].material
+            if mat is not None:
+                names.add(mat.name)
+    return len(names)
+
+
+def is_grid_object(obj):
+    return any(s.material is not None and MANIFEST_KEY in s.material
+               for s in obj.material_slots)
+
+
+def separate_object_by_material(context, obj):
+    """Split obj into one object per material. Returns list of resulting objects."""
+    view_layer = context.view_layer
+    for o in list(context.selected_objects):
+        o.select_set(False)
+    obj.select_set(True)
+    view_layer.objects.active = obj
+    if obj.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    before = set(context.scene.objects)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    try:
+        bpy.ops.mesh.separate(type='MATERIAL')
+    except RuntimeError:
+        pass
+    bpy.ops.object.mode_set(mode='OBJECT')
+    new_objs = [o for o in context.scene.objects if o not in before]
+    return [obj] + new_objs
+
+
+def split_and_rename_by_material(context, obj):
+    """Separate by material and rename each piece <origname>_<matname>. Returns pieces."""
+    base = sanitize_name(obj.name, 20)
+    pieces = separate_object_by_material(context, obj)
+    for p in pieces:
+        remove_unused_slots(context, p)
+        mat = p.material_slots[0].material if p.material_slots else None
+        if mat is not None:
+            p.name = f"{base}_{sanitize_name(mat.name, 16)}"
+        # new id will be generated lazily via export_key_for
+    return pieces
+
+
+def analyze_json_targets(targets):
+    """Return list of (name, kind, count) for the confirm dialog."""
+    plan = []
+    for obj in targets:
+        if is_grid_object(obj):
+            plan.append((obj.name, 'grid', used_material_count(obj)))
+        else:
+            n = used_material_count(obj)
+            plan.append((obj.name, 'multi' if n > 1 else 'single', max(n, 1)))
+    return plan
+
+
+def build_color_json(objs):
+    """Build {export_key: [r,g,b]} for the given objects (uses first material's base color)."""
+    data = {}
+    for obj in objs:
+        mat = None
+        for slot in obj.material_slots:
+            if slot.material is not None and MANIFEST_KEY not in slot.material:
+                mat = slot.material
+                break
+        if mat is None:
+            continue
+        data[export_key_for(obj)] = color_to_rgb255(get_base_color(mat))
+    return data
+
+
+class OBJECT_OT_export_color_json(bpy.types.Operator):
+    """Split JSON-mode objects per material and export colors for the Roblox plugin"""
+    bl_idname = "object.export_color_json"
+    bl_label = "Export Color JSON"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    to_clipboard: bpy.props.BoolProperty(name="Copy to Clipboard", default=True)
+    to_file: bpy.props.BoolProperty(
+        name="Also Save .json (next to .blend)", default=False)
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.type == 'MESH' for o in context.selected_objects)
+
+    def _targets(self, context):
+        return [o for o in context.selected_objects
+                if o.type == 'MESH' and get_object_mode(o) == 'JSON']
+
+    def invoke(self, context, event):
+        if not self._targets(context):
+            self.report({'WARNING'}, "No objects set to JSON mode")
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self, width=380)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="JSON export will modify these objects:", icon='ERROR')
+        box = layout.box()
+        col = box.column(align=True)
+        for name, kind, count in analyze_json_targets(self._targets(context)):
+            if kind == 'grid':
+                txt = f"{name}: restore from grid, split into {count}"
+            elif kind == 'multi':
+                txt = f"{name}: split into {count} parts (per material)"
+            else:
+                txt = f"{name}: keep as-is (1 material)"
+            col.label(text=txt, icon='MESH_DATA')
+        layout.label(text="Objects are replaced by per-material parts.", icon='INFO')
+        layout.prop(self, "to_clipboard")
+        layout.prop(self, "to_file")
+
+    def execute(self, context):
+        targets = self._targets(context)
+        if not targets:
+            self.report({'WARNING'}, "No objects set to JSON mode")
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT' and context.active_object:
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except RuntimeError:
+                pass
+
+        final_objs = []
+        for obj in list(targets):
+            if is_grid_object(obj):
+                restore_object_materials(obj)
+            if used_material_count(obj) > 1:
+                final_objs.extend(split_and_rename_by_material(context, obj))
+            else:
+                # Single material: rename for consistency, keep as one part.
+                mat = next((s.material for s in obj.material_slots if s.material), None)
+                if mat is not None:
+                    obj.name = f"{sanitize_name(obj.name, 20)}_{sanitize_name(mat.name, 16)}"
+                final_objs.append(obj)
+
+        data = build_color_json(final_objs)
+        if not data:
+            self.report({'WARNING'}, "No usable materials to export")
+            return {'CANCELLED'}
+
+        text = json.dumps(data, indent=4)
+        wrote = []
+        if self.to_clipboard:
+            context.window_manager.clipboard = text
+            wrote.append("clipboard")
+        if self.to_file:
+            blend_dir = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else ""
+            if not blend_dir:
+                self.report({'WARNING'}, "Save the .blend first to write a .json file")
+            else:
+                path = os.path.join(blend_dir, "colors.json")
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    wrote.append("colors.json")
+                except OSError as e:
+                    self.report({'ERROR'}, f"File write failed: {e}")
+                    return {'CANCELLED'}
+
+        self.report({'INFO'},
+                    f"Exported {len(data)} part color(s) to {', '.join(wrote) or 'nowhere'}")
+        return {'FINISHED'}
+
+
+def selected_modes(context):
+    """Set of modes among selected mesh objects."""
+    return {get_object_mode(o) for o in context.selected_objects if o.type == 'MESH'}
+
+
+class OBJECT_OT_process_selected(bpy.types.Operator):
+    """Process selected objects according to each one's mode"""
+    bl_idname = "object.mcg_process_selected"
+    bl_label = "Process Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.type == 'MESH' for o in context.selected_objects)
+
+    def execute(self, context):
+        s = context.scene.mcg_settings
+        modes = selected_modes(context)
+        ran = []
+
+        if 'ATLAS' in modes:
+            bpy.ops.object.material_color_grid(
+                group_name=s.grid_name,
+                resolution=s.resolution,
+                minimal_resolution=s.minimal_resolution,
+                cell_pixels=s.cell_pixels,
+                cell_padding=s.cell_padding,
+                bake_roughness=s.bake_roughness,
+                bake_metallic=s.bake_metallic,
+                create_vertex_groups=s.create_vertex_groups,
+                remap_uvs=s.remap_uvs,
+                replace_materials=s.replace_materials,
+                sync_all_users=s.sync_all_users,
+                remove_unused_slots=s.remove_unused_slots,
+                auto_export=s.auto_export_after_bake,
+            )
+            ran.append("atlas")
+
+        if 'VERTEX' in modes:
+            bpy.ops.object.bake_vertex_colors()
+            ran.append("vertex")
+
+        if not ran:
+            self.report({'WARNING'},
+                        "Set objects to Atlas or Vertex mode "
+                        "(JSON mode uses the Export JSON button).")
+            return {'CANCELLED'}
+
+        return {'FINISHED'}
+
+
+def _tri_count(mesh):
+    return sum(len(p.vertices) - 2 for p in mesh.polygons)
+
+
+def _uv_out_of_range(mesh):
+    uv = mesh.uv_layers.active
+    if uv is None:
+        return None  # no UV
+    for d in uv.data:
+        u, v = d.uv
+        if u < -0.001 or u > 1.001 or v < -0.001 or v > 1.001:
+            return True
+    return False
+
+
+class OBJECT_OT_roblox_check(bpy.types.Operator):
+    """Check selected objects for common Roblox export issues"""
+    bl_idname = "object.mcg_roblox_check"
+    bl_label = "Run Roblox Check"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.type == 'MESH' for o in context.selected_objects)
+
+    def execute(self, context):
+        s = context.scene.mcg_settings
+        meshes = [o for o in context.selected_objects if o.type == 'MESH']
+        lines = []
+
+        for obj in meshes:
+            mesh = obj.data
+            tris = _tri_count(mesh)
+            if tris > s.tri_warn_threshold:
+                lines.append(f"W|{obj.name}: {tris} tris (> {s.tri_warn_threshold})")
+
+            sc = obj.scale
+            if any(abs(c - 1.0) > 1e-3 for c in sc):
+                lines.append(f"W|{obj.name}: scale not applied "
+                             f"({sc[0]:.2f},{sc[1]:.2f},{sc[2]:.2f})")
+
+            oor = _uv_out_of_range(mesh)
+            if oor is None:
+                lines.append(f"W|{obj.name}: no UV map")
+            elif oor:
+                lines.append(f"I|{obj.name}: UVs outside 0-1 (tiling?)")
+
+            used_mats = used_material_count(obj)
+            if used_mats > 1 and get_object_mode(obj) != 'ATLAS':
+                lines.append(f"I|{obj.name}: {used_mats} materials "
+                             f"(consider Atlas mode)")
+
+            # Texture resolution checks
+            for slot in obj.material_slots:
+                mat = slot.material
+                if mat is None:
+                    continue
+                img = get_basecolor_image(mat)
+                if img is not None and max(img.size) > s.tex_warn_resolution:
+                    lines.append(f"W|{obj.name}: texture {img.size[0]}x{img.size[1]} "
+                                 f"(> {s.tex_warn_resolution})")
+                    break
+
+        if not lines:
+            lines.append(f"G|All checks passed ({len(meshes)} object(s)).")
+
+        s.check_report = "\n".join(lines)
+        self.report({'INFO'}, f"Checked {len(meshes)} object(s)")
+        return {'FINISHED'}
+
+
+def _mode_label(mode):
+    for ident, name, _desc in MODE_ITEMS:
+        if ident == mode:
+            return name
+    return mode
+
+
 class VIEW3D_PT_color_grid(bpy.types.Panel):
     bl_label = "Color Grid"
     bl_idname = "VIEW3D_PT_color_grid"
@@ -881,32 +1691,95 @@ class VIEW3D_PT_color_grid(bpy.types.Panel):
         layout = self.layout
         s = context.scene.mcg_settings
 
+        # ---- Per-object mode list (selected meshes only) ----
+        meshes = [o for o in context.selected_objects if o.type == 'MESH']
+        active = context.active_object if (
+            context.active_object and context.active_object.type == 'MESH') else None
+        MAX_ROWS = 16
+
         box = layout.box()
-        box.label(text="Bake / Update", icon='TEXTURE')
-        box.prop(s, "grid_name")
-        box.prop(s, "minimal_resolution")
-        box.prop(s, "cell_pixels" if s.minimal_resolution else "resolution")
-        row = box.row(align=True)
-        row.prop(s, "bake_roughness", toggle=True)
-        row.prop(s, "bake_metallic", toggle=True)
-        col = box.column(align=True)
-        col.prop(s, "create_vertex_groups")
-        col.prop(s, "remap_uvs")
-        col.prop(s, "replace_materials")
-        col.prop(s, "sync_all_users")
-        col.prop(s, "remove_unused_slots")
-        op = box.operator(OBJECT_OT_material_color_grid.bl_idname, text="Bake Selected to Grid")
-        op.group_name = s.grid_name
-        op.resolution = s.resolution
-        op.minimal_resolution = s.minimal_resolution
-        op.cell_pixels = s.cell_pixels
-        op.bake_roughness = s.bake_roughness
-        op.bake_metallic = s.bake_metallic
-        op.create_vertex_groups = s.create_vertex_groups
-        op.remap_uvs = s.remap_uvs
-        op.replace_materials = s.replace_materials
-        op.sync_all_users = s.sync_all_users
-        op.remove_unused_slots = s.remove_unused_slots
+        box.label(text="Objects & Modes", icon='OUTLINER')
+        if not meshes:
+            box.label(text="Select mesh objects.", icon='INFO')
+        else:
+            # Bulk set (applies to all selected meshes)
+            sub = box.column(align=True)
+            sub.label(text=f"Set all ({len(meshes)} meshes):")
+            row = sub.row(align=True)
+            for ident, name, _desc in MODE_ITEMS:
+                op = row.operator(OBJECT_OT_set_grid_mode.bl_idname, text=name)
+                op.mode = ident
+                op.object_name = ""
+
+            box.separator()
+
+            def mode_row(container, obj):
+                container.label(text=obj.name, icon='MESH_DATA')
+                r = container.row(align=True)
+                current = get_object_mode(obj)
+                for ident, name, _desc in MODE_ITEMS:
+                    op = r.operator(OBJECT_OT_set_grid_mode.bl_idname, text=name,
+                                    depress=(current == ident))
+                    op.mode = ident
+                    op.object_name = obj.name
+
+            if len(meshes) <= MAX_ROWS:
+                for obj in meshes:
+                    mode_row(box.column(align=True), obj)
+            else:
+                # Too many to list: show counts + only the active object's row.
+                counts = {}
+                for o in meshes:
+                    m = get_object_mode(o)
+                    counts[m] = counts.get(m, 0) + 1
+                summary = ", ".join(f"{_mode_label(k)}:{counts[k]}" for k in counts)
+                box.label(text=f"{len(meshes)} meshes — {summary}", icon='INFO')
+                box.label(text="Too many to list. Use Set all, or select fewer.")
+                if active is not None:
+                    box.separator()
+                    box.label(text="Active object:")
+                    mode_row(box.column(align=True), active)
+
+        modes = {get_object_mode(o) for o in meshes} if meshes else set()
+        has_atlas = 'ATLAS' in modes
+        has_vertex = 'VERTEX' in modes
+
+        box = layout.box()
+        box.label(text="Bake / Process", icon='TEXTURE')
+
+        # Atlas settings only matter when an Atlas object is selected.
+        if has_atlas:
+            box.prop(s, "grid_name")
+            box.prop(s, "minimal_resolution")
+            box.prop(s, "cell_pixels" if s.minimal_resolution else "resolution")
+            box.prop(s, "cell_padding")
+            row = box.row(align=True)
+            row.prop(s, "bake_roughness", toggle=True)
+            row.prop(s, "bake_metallic", toggle=True)
+            col = box.column(align=True)
+            col.prop(s, "create_vertex_groups")
+            col.prop(s, "remap_uvs")
+            col.prop(s, "replace_materials")
+            col.prop(s, "sync_all_users")
+            col.prop(s, "remove_unused_slots")
+            col.prop(s, "auto_export_after_bake")
+
+        # Adaptive primary button label.
+        if has_atlas and has_vertex:
+            label = "Bake Selected (Atlas + Vertex)"
+        elif has_atlas:
+            label = "Bake Selected to Grid"
+        elif has_vertex:
+            label = "Bake Vertex Colors"
+        else:
+            label = "Nothing to Bake"
+
+        row = box.row()
+        row.scale_y = 1.3
+        row.enabled = has_atlas or has_vertex
+        row.operator(OBJECT_OT_process_selected.bl_idname, text=label)
+        if not (has_atlas or has_vertex) and meshes:
+            box.label(text="Set objects to Atlas or Vertex (JSON uses Export below).", icon='INFO')
 
         box = layout.box()
         box.label(text="Tools", icon='TOOL_SETTINGS')
@@ -915,6 +1788,27 @@ class VIEW3D_PT_color_grid(bpy.types.Panel):
         box.operator(OBJECT_OT_select_grid_users.bl_idname, text="Select Objects Using Grid")
         box.operator(OBJECT_OT_compact_grid.bl_idname, text="Compact Grid (Remove Unused)")
         box.operator(OBJECT_OT_export_grid_png.bl_idname, text="Export Textures (PNG)")
+
+        box = layout.box()
+        box.label(text="Export Color Data (JSON)", icon='TEXT')
+        box.operator(OBJECT_OT_export_color_json.bl_idname, text="Export JSON…")
+        box.label(text="Splits JSON-mode objects per material.", icon='INFO')
+
+        box = layout.box()
+        box.label(text="Roblox Check", icon='CHECKMARK')
+        row = box.row(align=True)
+        row.prop(s, "tri_warn_threshold")
+        box.prop(s, "tex_warn_resolution")
+        box.operator(OBJECT_OT_roblox_check.bl_idname, text="Run Roblox Check")
+        if s.check_report:
+            icon_for = {'W': 'ERROR', 'I': 'INFO', 'G': 'CHECKMARK'}
+            rep = box.column(align=True)
+            for line in s.check_report.split("\n"):
+                if "|" in line:
+                    lvl, msg = line.split("|", 1)
+                else:
+                    lvl, msg = 'I', line
+                rep.label(text=msg, icon=icon_for.get(lvl, 'DOT'))
 
         box = layout.box()
         box.label(text="Reverse", icon='MATERIAL')
@@ -1121,6 +2015,11 @@ classes = (
     OBJECT_OT_select_grid_users,
     OBJECT_OT_compact_grid,
     OBJECT_OT_export_grid_png,
+    OBJECT_OT_export_color_json,
+    OBJECT_OT_bake_vertex_colors,
+    OBJECT_OT_process_selected,
+    OBJECT_OT_roblox_check,
+    OBJECT_OT_set_grid_mode,
     VIEW3D_PT_color_grid,
 )
 
@@ -1128,6 +2027,10 @@ classes = (
 def register():
     for c in classes:
         bpy.utils.register_class(c)
+    bpy.types.Object.mcg_mode = bpy.props.EnumProperty(
+        name="Mode", items=MODE_ITEMS, get=_mode_get, set=_mode_set,
+        description="How this object is processed when baking",
+    )
     bpy.types.Scene.mcg_settings = bpy.props.PointerProperty(type=MCGSettings)
     bpy.types.VIEW3D_MT_object.append(menu_func)
 
@@ -1135,6 +2038,7 @@ def register():
 def unregister():
     bpy.types.VIEW3D_MT_object.remove(menu_func)
     del bpy.types.Scene.mcg_settings
+    del bpy.types.Object.mcg_mode
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
 

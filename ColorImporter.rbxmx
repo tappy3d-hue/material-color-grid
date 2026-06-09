@@ -1,0 +1,161 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+	<External>null</External>
+	<External>nil</External>
+	<Item class="Script" referent="RBX_MCG_COLOR_IMPORTER_V2">
+		<Properties>
+			<ProtectedString name="Source"><![CDATA[--[[
+	Color Importer v2 (for the Material Color Grid Blender addon)
+
+	Workflow:
+	  1. In Blender, set objects to "JSON" mode and use "Export JSON (Clipboard)".
+	  2. Import your model (FBX/glTF) into Studio.
+	  3. Paste the JSON below, select the imported model in Explorer, and click Apply.
+
+	Matching is by EXACT name key (Blender exports "<name>_<id>" keys). The plugin
+	tries each part's own name and its parent's name. On success it also writes the
+	color as an Attribute ("MCGColor") so you can re-apply later regardless of renames.
+]]
+
+local Selection = game:GetService("Selection")
+local HttpService = game:GetService("HttpService")
+
+local toolbar = plugin:CreateToolbar("Blender Tools")
+local pluginButton = toolbar:CreateButton("Import Colors", "Import Blender material colors from JSON", "")
+
+local widgetInfo = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 360, 440, 260, 320)
+local widget = plugin:CreateDockWidgetPluginGui("ColorImporterWidgetV2", widgetInfo)
+widget.Title = "Blender Color Importer"
+
+local bg = Instance.new("Frame")
+bg.Size = UDim2.new(1, 0, 1, 0)
+bg.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+bg.Parent = widget
+
+local instruction = Instance.new("TextLabel")
+instruction.Size = UDim2.new(0.92, 0, 0.1, 0)
+instruction.Position = UDim2.new(0.04, 0, 0.02, 0)
+instruction.Text = "JSONを貼り付け、Explorerで対象モデルを選択して適用"
+instruction.TextColor3 = Color3.fromRGB(220, 220, 220)
+instruction.BackgroundTransparency = 1
+instruction.TextScaled = true
+instruction.Parent = bg
+
+local textBox = Instance.new("TextBox")
+textBox.Size = UDim2.new(0.92, 0, 0.58, 0)
+textBox.Position = UDim2.new(0.04, 0, 0.14, 0)
+textBox.MultiLine = true
+textBox.ClearTextOnFocus = false
+textBox.Text = "{}"
+textBox.TextXAlignment = Enum.TextXAlignment.Left
+textBox.TextYAlignment = Enum.TextYAlignment.Top
+textBox.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+textBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+textBox.TextSize = 12
+textBox.Parent = bg
+
+local applyButton = Instance.new("TextButton")
+applyButton.Size = UDim2.new(0.92, 0, 0.12, 0)
+applyButton.Position = UDim2.new(0.04, 0, 0.76, 0)
+applyButton.Text = "選択中のモデルに適用"
+applyButton.BackgroundColor3 = Color3.fromRGB(0, 120, 215)
+applyButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+applyButton.Font = Enum.Font.SourceSansBold
+applyButton.TextSize = 18
+applyButton.Parent = bg
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(0.92, 0, 0.08, 0)
+statusLabel.Position = UDim2.new(0.04, 0, 0.9, 0)
+statusLabel.Text = ""
+statusLabel.BackgroundTransparency = 1
+statusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+statusLabel.TextSize = 14
+statusLabel.Parent = bg
+
+pluginButton.Click:Connect(function()
+	widget.Enabled = not widget.Enabled
+end)
+
+local function setStatus(text, color)
+	statusLabel.Text = text
+	statusLabel.TextColor3 = color or Color3.fromRGB(200, 200, 200)
+end
+
+-- Exact-key lookup: try the part's own name, then its parent's name.
+local function findColor(part, colorData)
+	if colorData[part.Name] then
+		return colorData[part.Name]
+	end
+	local parent = part.Parent
+	if parent and colorData[parent.Name] then
+		return colorData[parent.Name]
+	end
+	return nil
+end
+
+applyButton.MouseButton1Click:Connect(function()
+	setStatus("処理中...", Color3.fromRGB(200, 200, 200))
+
+	local ok, colorData = pcall(function()
+		return HttpService:JSONDecode(textBox.Text)
+	end)
+	if not ok or type(colorData) ~= "table" then
+		setStatus("❌ JSONの形式が正しくありません", Color3.fromRGB(255, 100, 100))
+		return
+	end
+
+	local selected = Selection:Get()
+	if #selected == 0 then
+		setStatus("❌ Explorerで対象モデルを選択してください", Color3.fromRGB(255, 100, 100))
+		return
+	end
+
+	local applied = 0
+	local missed = {}
+
+	local function apply(inst)
+		if inst:IsA("BasePart") then
+			local rgb = findColor(inst, colorData)
+			if rgb then
+				local c = Color3.fromRGB(rgb[1], rgb[2], rgb[3])
+				inst.Color = c
+				-- Write-back: makes future re-applies independent of names.
+				inst:SetAttribute("MCGColor", c)
+				applied += 1
+			else
+				table.insert(missed, inst.Name)
+			end
+		end
+		for _, child in ipairs(inst:GetChildren()) do
+			apply(child)
+		end
+	end
+
+	for _, obj in ipairs(selected) do
+		apply(obj)
+	end
+
+	if applied > 0 then
+		setStatus(string.format("✅ 完了: %d 個のパーツに適用", applied), Color3.fromRGB(100, 255, 100))
+		if #missed > 0 then
+			warn("[ColorImporter] 未適用 (" .. #missed .. "):", table.concat(missed, ", "))
+		end
+	else
+		setStatus("⚠️ 一致なし。名前とJSONキーを確認してください", Color3.fromRGB(255, 200, 50))
+		warn("[ColorImporter] 一致するキーがありませんでした:", table.concat(missed, ", "))
+	end
+end)
+]]></ProtectedString>
+			<bool name="Disabled">false</bool>
+			<Content name="LinkedSource"><null></null></Content>
+			<token name="RunContext">0</token>
+			<string name="ScriptGuid">{B2D9A1F0-3C44-4E21-9A77-7F2C9E55D1B3}</string>
+			<BinaryString name="AttributesSerialize"></BinaryString>
+			<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+			<bool name="DefinesCapabilities">false</bool>
+			<string name="Name">ColorImporterV2</string>
+			<int64 name="SourceAssetId">-1</int64>
+			<BinaryString name="Tags"></BinaryString>
+		</Properties>
+	</Item>
+</roblox>
