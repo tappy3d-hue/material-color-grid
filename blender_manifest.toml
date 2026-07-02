@@ -1,0 +1,18 @@
+schema_version = "1.0.0"
+
+id = "material_color_grid"
+version = "1.25.0"
+name = "Material Color Grid Texture"
+tagline = "Pack material colors and textures into tiny atlases for Roblox"
+maintainer = "tappy3d <tappy3d@gmail.com>"
+type = "add-on"
+website = "https://github.com/tappy3d-hue/material-color-grid"
+tags = ["Material", "UV", "Import-Export"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+network = "Check GitHub for add-on updates (optional, user-initiated)"
+files = "Write atlas PNG / colors.json next to the .blend file"
