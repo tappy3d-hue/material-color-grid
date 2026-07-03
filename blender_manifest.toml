@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "material_color_grid"
-version = "1.25.0"
+version = "1.34.0"
 name = "Material Color Grid Texture"
 tagline = "Pack material colors and textures into tiny atlases for Roblox"
 maintainer = "tappy3d <tappy3d@gmail.com>"
